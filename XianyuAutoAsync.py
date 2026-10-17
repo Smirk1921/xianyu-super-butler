@@ -1834,28 +1834,17 @@ class XianyuLive:
                     )
                     return
 
-                from utils.item_relist import load_relist_config, relist_item
-                relist_config = load_relist_config()
-                if (
-                    not relist_config.get('seller_url')
-                    or not relist_config.get('item_selector')
-                ):
-                    logger.warning(
-                        f"【{self.cookie_id}】商品 {item_id} {reason}后满足上架条件，"
-                        f"但未配置卖家页选择器，无法自动上架；请手动处理: "
-                        f"https://www.goofish.com/item?id={item_id}"
-                    )
-                    service.record_attempt(
-                        user_id, self.cookie_id, item_id,
-                        'skipped', '未配置卖家页选择器',
-                    )
-                    return
+                from utils.item_relist import build_stock_targets, relist_item
 
+                stock_targets = build_stock_targets(
+                    (evaluation.get('stock') or {}).get('details') or []
+                )
                 details = db_manager.get_cookie_details(self.cookie_id) or {}
                 result = await relist_item(
                     self.cookie_id,
                     self.cookies_str,
                     item_id,
+                    stock_targets=stock_targets,
                     headless=not bool(details.get('show_browser')),
                 )
                 if result.get('success'):
@@ -7781,7 +7770,8 @@ class XianyuLive:
         设计约束：
         - 默认关闭，且默认 dry-run，只记录候选，不真正点击；
         - 逐商品开启，避免把手动下架/违规下架的商品重新挂上去；
-        - 只对 data 卡判断库存，text/api/image 无法确认余量；
+        - 批量卡按剩余行数上架，发完不再上架；
+          text/image/api 没有本地余量，按无限库存上架；
         - 与擦亮一致：随机错峰、风控冷却、可中断睡眠。
         """
         await self._interruptible_sleep(random.uniform(0, 180))
@@ -7866,23 +7856,11 @@ class XianyuLive:
                             )
                             continue
 
-                        from utils.item_relist import load_relist_config
-                        relist_config = load_relist_config()
-                        if (
-                            not relist_config.get('seller_url')
-                            or not relist_config.get('item_selector')
-                        ):
-                            logger.warning(
-                                f"【{self.cookie_id}】商品 {item_id} 满足上架条件，"
-                                f"但未配置卖家页选择器，无法自动上架；请手动处理: "
-                                f"https://www.goofish.com/item?id={item_id}"
-                            )
-                            service.record_attempt(
-                                user_id, self.cookie_id, item_id, 'skipped',
-                                '未配置卖家页选择器',
-                            )
-                            continue
+                        from utils.item_relist import build_stock_targets
 
+                        stock_targets = build_stock_targets(
+                            (candidate.get('stock') or {}).get('details') or []
+                        )
                         try:
                             from utils.item_relist import relist_item
                             details = db_manager.get_cookie_details(self.cookie_id) or {}
@@ -7890,6 +7868,7 @@ class XianyuLive:
                                 self.cookie_id,
                                 self.cookies_str,
                                 item_id,
+                                stock_targets=stock_targets,
                                 headless=not bool(details.get('show_browser')),
                             )
                         except Exception as relist_error:

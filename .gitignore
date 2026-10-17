@@ -811,6 +811,5 @@ frontend/coverage/
 .wrangler/
 deploy/.wrangler/
 
-# 自动重新上架本地配置与页面快照（含账号页面信息，不入库）
-relist_config.json
+# 自动重新上架页面快照（含账号页面信息，不入库）
 relist_probe.html

@@ -2,13 +2,15 @@
 
 覆盖：
 - 批量卡密库存充足/不足
-- 固定文本、图片、API 卡密无法判断库存，不参与自动上架
+- 固定文本、图片、API 卡密按无限库存处理
 - 卡密停用、未绑定、多规格严格模式
 - 旧版 delivery_rules 的库存判断
 - 冷却、pending、手动商品等资格过滤
 - 商品级开关的 upsert 和候选查询
+- 执行器库存目标换算与 0 库存保护
 """
 
+import asyncio
 import os
 import tempfile
 import unittest
@@ -16,6 +18,7 @@ from datetime import datetime, timedelta
 
 from app.db_manager import DBManager
 from app.item_relist import ItemRelistService
+from utils.item_relist import build_stock_targets, normalize_stock, relist_item
 
 
 class ItemRelistTests(unittest.TestCase):
@@ -277,6 +280,46 @@ class ItemRelistTests(unittest.TestCase):
         rows = self.service.list_candidates(self.user_id, "acc")
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]["eligible"])
+
+
+class RelistExecutorTest(unittest.TestCase):
+    """执行器辅助函数的单元测试（不启动浏览器）。"""
+
+    def test_data_stock_lists_one_unit_to_avoid_overselling(self):
+        # 多个商品链接可能共用同一张批量卡，每个链接只挂 1 件
+        self.assertEqual(build_stock_targets([{"stock": 5}]), [1])
+
+    def test_text_image_api_use_infinite_stock(self):
+        self.assertEqual(
+            build_stock_targets([{"stock": None}], infinite_stock=9999),
+            [9999],
+        )
+
+    def test_mixed_specs_map_in_order(self):
+        self.assertEqual(
+            build_stock_targets([{"stock": 2}, {"stock": None}, {"stock": 7}]),
+            [1, 9999, 1],
+        )
+
+    def test_no_details_falls_back_to_infinite(self):
+        self.assertEqual(build_stock_targets([]), [9999])
+
+    def test_stock_is_capped_at_platform_limit(self):
+        self.assertEqual(normalize_stock(99999), 10000)
+
+    def test_zero_stock_is_preserved(self):
+        self.assertEqual(normalize_stock(0), 0)
+
+    def test_zero_stock_detail_stays_zero(self):
+        # 批量卡发完后不能变成 1，否则会重新挂出无货订单
+        self.assertEqual(build_stock_targets([{"stock": 0}]), [0])
+
+    def test_relist_refuses_zero_stock_without_launching_browser(self):
+        result = asyncio.run(
+            relist_item("acc", "cookie=1", "1093294412397", stock_targets=[0])
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("库存目标为 0", result["reason"])
 
 
 if __name__ == "__main__":

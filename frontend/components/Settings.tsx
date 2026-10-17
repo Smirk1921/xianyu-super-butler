@@ -503,7 +503,7 @@ const Settings: React.FC = () => {
           <section className="section-panel">
             <SectionHeader
               title="自动重新上架"
-              description="商品售完下架后，如果绑定的批量卡密还有库存，自动重新上架。默认只检查不执行。"
+              description="商品售完下架后，如果绑定的卡密仍可用，自动通过鱼小铺重新上架。默认只检查不执行。"
               icon={RefreshCw}
             />
             <SettingToggle
@@ -517,7 +517,7 @@ const Settings: React.FC = () => {
             />
             <SettingToggle
               title="仅检查不执行（dry-run）"
-              description="开启时只在日志里记录满足条件的商品，不会真的点击上架。确认卖家页选择器稳定后再关闭。"
+              description="开启时只在日志里记录满足条件的商品，不会真的执行上架。确认能正常打开鱼小铺商品编辑页后再关闭。"
               checked={toBool(settings.auto_relist_dry_run, true)}
               onChange={() => setSettings({
                 ...settings,
@@ -572,9 +572,9 @@ const Settings: React.FC = () => {
               </label>
             </div>
             <p className="px-4 pb-3 text-xs text-gray-500">
-              「批量」卡密按剩余行数判断，发完才不再自动上架；固定文本、图片和 API 发卡
-              没有本地库存概念，只要有内容就视为可继续上架。执行器需要先用探测脚本生成
-              relist_config.json。
+              上架走鱼小铺「商品管理 → 下架 → 编辑 → 发布」通道，不需要额外配置。
+              「批量」卡密每个链接只挂 1 件，卖出一单后自动补上，避免多个链接共用同一张卡超卖；
+              固定文本、图片和 API 发卡没有本地库存概念，按无限库存处理。
             </p>
           </section>
 
