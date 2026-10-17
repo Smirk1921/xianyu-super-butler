@@ -418,10 +418,9 @@ async def relist_item(
 
         # 部分场景会先弹二次确认
         await page.wait_for_timeout(800)
-        confirm = page.locator(
-            ".ant-modal-confirm-btns button.ant-btn-primary, "
-            ".ant-modal-footer button.ant-btn-primary"
-        )
+        # 只在真正的二次确认弹窗里点主按钮；发布成功弹窗也有底部按钮，
+        # 但不会带 ant-modal-confirm-btns，避免误点到「查看商品」跳走。
+        confirm = page.locator(".ant-modal-confirm-btns button.ant-btn-primary")
         for index in range(await confirm.count()):
             element = confirm.nth(index)
             try:
@@ -431,9 +430,9 @@ async def relist_item(
             except Exception:
                 continue
 
-        deadline = asyncio.get_event_loop().time() + max(10, timeout_ms / 1000 / 3)
+        deadline = asyncio.get_running_loop().time() + max(10, timeout_ms / 1000 / 3)
         last_error = ""
-        while asyncio.get_event_loop().time() < deadline:
+        while asyncio.get_running_loop().time() < deadline:
             await page.wait_for_timeout(700)
             try:
                 body_after = await page.inner_text("body")
