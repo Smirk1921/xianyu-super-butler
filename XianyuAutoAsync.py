@@ -770,6 +770,7 @@ class XianyuLive:
         self.last_heartbeat_response = 0
         self.heartbeat_task = None
         self.ws = None
+        self.ws_disconnect_count = 0
         self._im_pending = {}
         self._im_request_lock = asyncio.Lock()
 
@@ -798,6 +799,8 @@ class XianyuLive:
         # 自动发货已发送订单记录
         self.delivery_sent_orders = set()  # 记录已发货的订单ID，防止重复发货
         self.delivery_blocked_orders = set()  # 部分发货或内容已消耗的订单，阻止自动重试造成重复发送
+        # 断线/漏事件后的待发货补发对账节流：order_id -> 上次尝试时间
+        self._delivery_reconcile_attempts = {}
 
         # 交易卡片落库前暂存卖家端接口返回的真实成交数据（金额、数量、收货信息）
         self._pending_order_real_values = {}
@@ -1730,8 +1733,73 @@ class XianyuLive:
 
         return result
 
+    async def _reconcile_pending_deliveries(self):
+        """补发对账：处理断线或消息漏收导致的待发货订单。
+
+        只处理最近 24 小时、状态为 pending_ship、且没有 card_shipments
+        记录的订单；同一订单 10 分钟内最多尝试一次。发货本身复用
+        ``_handle_auto_delivery``，内部已有订单状态、归属和去重校验。
+        """
+        try:
+            if not self.ws or getattr(self.ws, 'closed', False):
+                logger.info(f"【{self.cookie_id}】WebSocket 未连接，跳过待发货补发对账")
+                return
+
+            from app.db_manager import db_manager
+
+            orders = db_manager.list_pending_delivery_orders(
+                self.cookie_id, hours=24, limit=5
+            )
+            if not orders:
+                return
+
+            now = time.time()
+            for order in orders:
+                order_id = str(order.get('order_id') or '')
+                if not order_id or order_id in self.delivery_sent_orders:
+                    continue
+
+                last_attempt = self._delivery_reconcile_attempts.get(order_id, 0)
+                if now - last_attempt < 600:
+                    continue
+
+                item_id = str(order.get('item_id') or '')
+                buyer_id = str(order.get('buyer_id') or '')
+                chat_id = str(order.get('chat_id') or '')
+                if not chat_id and buyer_id:
+                    chat_id = db_manager.find_chat_id_by_buyer(
+                        self.cookie_id, buyer_id
+                    ) or ''
+                if not item_id or not buyer_id or not chat_id:
+                    logger.warning(
+                        f"【{self.cookie_id}】订单 {order_id} 缺少补发所需信息: "
+                        f"item_id={item_id or '空'} "
+                        f"buyer_id={buyer_id or '空'} "
+                        f"chat_id={chat_id or '空'}"
+                    )
+                    continue
+
+                self._delivery_reconcile_attempts[order_id] = now
+                logger.info(
+                    f"【{self.cookie_id}】检测到待补发订单 {order_id}，开始对账"
+                )
+                await self._handle_auto_delivery(
+                    self.ws,
+                    {},
+                    f"买家{buyer_id}",
+                    buyer_id,
+                    item_id,
+                    chat_id,
+                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                    order_id=order_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】待发货补发对账失败: {self._safe_str(e)}")
+
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
-                                   item_id: str, chat_id: str, msg_time: str):
+                                   item_id: str, chat_id: str, msg_time: str, order_id: str = None):
         """统一处理自动发货逻辑"""
         try:
             # 检查商品是否属于当前cookies
@@ -1747,8 +1815,8 @@ class XianyuLive:
                     logger.error(f'[{msg_time}] 【{self.cookie_id}】检查商品归属失败: {self._safe_str(e)}，跳过自动发货')
                     return
 
-            # 提取订单ID
-            order_id = self._extract_order_id(message)
+            # 提取订单ID（补发对账时由调用方直接传入）
+            order_id = order_id or self._extract_order_id(message)
 
             # 如果order_id不存在，直接返回
             if not order_id:
@@ -1762,10 +1830,34 @@ class XianyuLive:
                 if str(current_order.get('cookie_id') or '') != str(self.cookie_id):
                     logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 不属于当前账号，拒绝自动发货')
                     return
-                if current_order.get('item_id') and str(current_order.get('item_id')) != str(item_id):
-                    logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 商品归属不一致，拒绝自动发货')
-                    return
-                if current_order.get('buyer_id') and str(current_order.get('buyer_id')) != str(send_user_id):
+                order_item_id = str(current_order.get('item_id') or '').strip()
+                if order_item_id and order_item_id != str(item_id):
+                    if db_manager.get_item_info(self.cookie_id, order_item_id):
+                        logger.warning(
+                            f'[{msg_time}] 【{self.cookie_id}】消息商品 {item_id} 与订单商品 '
+                            f'{order_item_id} 不一致，以订单为准继续发货'
+                        )
+                        item_id = order_item_id
+                    elif db_manager.get_item_info(self.cookie_id, str(item_id)):
+                        logger.warning(
+                            f'[{msg_time}] 【{self.cookie_id}】订单商品 {order_item_id} 不在商品库，'
+                            f'改用消息商品 {item_id} 并修正订单'
+                        )
+                        db_manager.insert_or_update_order(
+                            order_id=order_id, item_id=str(item_id)
+                        )
+                    else:
+                        logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 商品归属不一致，拒绝自动发货')
+                        return
+
+                order_buyer_id = str(current_order.get('buyer_id') or '').strip()
+                if order_buyer_id in ('', 'unknown_user'):
+                    # 订单买家未知，用消息发送者补全
+                    if send_user_id and send_user_id != 'unknown':
+                        db_manager.insert_or_update_order(
+                            order_id=order_id, buyer_id=send_user_id
+                        )
+                elif order_buyer_id != str(send_user_id):
                     logger.error(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 买家归属不一致，拒绝自动发货')
                     return
 
@@ -4285,17 +4377,90 @@ class XianyuLive:
             await asyncio.sleep(0.5)
             return await self.get_item_info(item_id, retry_count + 1)
 
+    @staticmethod
+    def _is_card_update_message(message: dict) -> bool:
+        """订单卡片更新消息：message['1'] 是字符串，详情在 message['4']。
+
+        买家付款后闲鱼会把原来的订单卡片更新成 ``TRADE_PAID_DONE_SELLER``，
+        结构和普通聊天消息不同。旧实现直接把它当“非聊天消息”丢掉，导致
+        自动发货完全不触发。
+        """
+        return (
+            isinstance(message, dict)
+            and isinstance(message.get('1'), str)
+            and isinstance(message.get('4'), dict)
+            and (
+                'reminderContent' in message['4']
+                or 'detailNotice' in message['4']
+            )
+        )
+
+    def _extract_message_identity(self, message: dict):
+        """提取 (item_id, sender_user_id)，优先使用权威字段。
+
+        优先级：
+        1. ``message['4']['reminderUrl']`` 的 ``itemId``（订单卡片更新）
+        2. ``message['1']['10']['reminderUrl']`` 的 ``itemId``（普通聊天）
+        3. ``senderUserId`` / ``xxx@goofish`` 作为买家 ID
+
+        特别注意：``message['1']`` 可能是 ``4350224982274.PNM`` 这类消息内容
+        ID，或 ``68018276297@goofish`` 这类会话 ID，都不是商品 ID。
+        """
+        item_id = ''
+        buyer_id = ''
+        if not isinstance(message, dict):
+            return item_id, buyer_id
+
+        message_1 = message.get('1')
+        message_4 = message.get('4')
+
+        def _item_from_url(url):
+            if isinstance(url, str) and 'itemId=' in url:
+                return url.split('itemId=')[1].split('&')[0]
+            return ''
+
+        # 订单卡片更新形态：详情在 message['4']
+        if isinstance(message_4, dict):
+            item_id = _item_from_url(message_4.get('reminderUrl'))
+            buyer_id = str(message_4.get('senderUserId') or '')
+
+        # 普通聊天形态：详情在 message['1']['10']
+        if isinstance(message_1, dict):
+            message_10 = message_1.get('10') if isinstance(message_1.get('10'), dict) else {}
+            item_id = item_id or _item_from_url(message_10.get('reminderUrl'))
+            buyer_id = buyer_id or str(message_10.get('senderUserId') or '')
+            inner = message_1.get('1')
+            if not buyer_id and isinstance(inner, dict):
+                sender = inner.get('1')
+                if isinstance(sender, str) and '@' in sender:
+                    buyer_id = sender.split('@')[0]
+
+        # 字符串形态：只提取会话/发送者，不把 .PNM 内容 ID 当商品
+        if isinstance(message_1, str):
+            candidate = message_1.strip()
+            if not buyer_id and '@' in candidate:
+                buyer_id = candidate.split('@')[0]
+
+        # 兜底：message['3'] 里的 senderUserId
+        if not buyer_id:
+            message_3 = message.get('3')
+            if isinstance(message_3, dict):
+                buyer_id = str(message_3.get('senderUserId') or '')
+
+        return item_id, buyer_id
+
     def extract_item_id_from_message(self, message):
         """从消息中提取商品ID的辅助方法"""
         try:
-            # 方法1: 从message["1"]中提取（如果是字符串格式）
+            # 方法1: 从message["1"]中提取（仅接受纯数字）。
+            #      形如 "4350224982274.PNM" 是消息内容 ID，"68018276297@goofish"
+            #      是会话 ID，都不是商品 ID，不能取其中一段数字当商品。
             message_1 = message.get('1')
             if isinstance(message_1, str):
-                # 尝试从字符串中提取数字ID
-                id_match = re.search(r'(\d{10,})', message_1)
-                if id_match:
-                    logger.info(f"从message[1]字符串中提取商品ID: {id_match.group(1)}")
-                    return id_match.group(1)
+                candidate = message_1.strip()
+                if candidate.isdigit() and len(candidate) >= 10:
+                    logger.info(f"从message[1]字符串中提取商品ID: {candidate}")
+                    return candidate
 
             # 方法2: 从message["3"]中提取
             message_3 = message.get('3', {})
@@ -4353,11 +4518,21 @@ class XianyuLive:
                             return result
 
                 elif isinstance(obj, str):
-                    # 从字符串中提取可能的商品ID
-                    id_match = re.search(r'(\d{10,})', obj)
-                    if id_match:
-                        logger.info(f"从{path}字符串中提取商品ID: {id_match.group(1)}")
-                        return id_match.group(1)
+                    text = obj.strip()
+                    # 明确标记为商品 ID 的 URL 优先
+                    if 'itemId=' in text:
+                        candidate = text.split('itemId=')[1].split('&')[0]
+                        if candidate.isdigit():
+                            logger.info(f"从{path}的 itemId 参数提取商品ID: {candidate}")
+                            return candidate
+                        return None
+                    # 内容 ID（xxx.PNM）和会话 ID（xxx@goofish）都不是商品 ID
+                    if '.PNM' in text or '@goofish' in text or '@' in text:
+                        return None
+                    # 只接受纯数字字符串，不再从任意文本里截取数字
+                    if text.isdigit() and len(text) >= 10:
+                        logger.info(f"从{path}字符串中提取商品ID: {text}")
+                        return text
 
                 return None
 
@@ -5882,8 +6057,10 @@ class XianyuLive:
                             # 先保存订单基本信息（包含时间和收货人信息）
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
-                                item_id=item_id,
-                                buyer_id=buyer_id,
+                                # 卖家端接口返回的 item_id/buyer_id 才是成交记录，
+                                # 调用方传入的可能来自消息上下文，存在解析错误。
+                                item_id=result.get('item_id') or item_id,
+                                buyer_id=result.get('buyer_id') or buyer_id,
                                 spec_name=spec_name,
                                 spec_value=spec_value,
                                 quantity=quantity,
@@ -7307,6 +7484,8 @@ class XianyuLive:
                             f"【{self.cookie_id}】定时订单同步完成: 共 {result['total']} 单，"
                             f"成功 {result['saved']}，失败 {result['failed']}"
                         )
+                        # 同步完成后补发：覆盖断线/听漏期间没有触发自动发货的订单
+                        await self._reconcile_pending_deliveries()
                     except asyncio.CancelledError:
                         logger.info(f"【{self.cookie_id}】订单同步被取消")
                         raise
@@ -9328,16 +9507,17 @@ class XianyuLive:
                 pass
 
     def is_chat_message(self, message):
-        """判断是否为用户聊天消息"""
+        """判断是否为用户聊天消息（含订单卡片的更新消息）。"""
         try:
-            return (
-                isinstance(message, dict)
-                and "1" in message
-                and isinstance(message["1"], dict)
-                and "10" in message["1"]
-                and isinstance(message["1"]["10"], dict)
-                and "reminderContent" in message["1"]["10"]
-            )
+            if not isinstance(message, dict) or "1" not in message:
+                return False
+            if isinstance(message["1"], dict):
+                return (
+                    isinstance(message["1"].get("10"), dict)
+                    and "reminderContent" in message["1"]["10"]
+                )
+            # 订单卡片更新：message['1'] 是字符串，详情在 message['4']
+            return self._is_card_update_message(message)
         except Exception:
             return False
 
@@ -10177,31 +10357,29 @@ class XianyuLive:
                         temp_item_id = None
 
                         # 提取用户ID
-                        try:
-                            message_1 = message.get("1")
-                            if isinstance(message_1, str) and '@' in message_1:
-                                temp_user_id = message_1.split('@')[0]
-                            elif isinstance(message_1, dict):
-                                # 从字典中提取用户ID
-                                if "10" in message_1 and isinstance(message_1["10"], dict):
-                                    temp_user_id = message_1["10"].get("senderUserId", "unknown_user")
-                                else:
-                                    temp_user_id = "unknown_user"
-                            else:
-                                temp_user_id = "unknown_user"
-                        except:
+                        # 提取买家/商品 ID：优先 reminderUrl / senderUserId，
+                        # 避免把 .PNM 内容 ID 或会话 ID 当成商品 ID。
+                        temp_item_id, temp_user_id = self._extract_message_identity(message)
+                        if not temp_item_id:
+                            temp_item_id = self.extract_item_id_from_message(message)
+                        if not temp_user_id:
                             temp_user_id = "unknown_user"
 
-                        # 提取商品ID
+                        # 已有订单里的真实身份优先：消息解析失败时不能覆盖好数据。
+                        # 只有解析出的商品确实存在于本地商品库时才采信。
                         try:
-                            if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
-                                url_info = message["1"]["10"].get("reminderUrl", "")
-                                if isinstance(url_info, str) and "itemId=" in url_info:
-                                    temp_item_id = url_info.split("itemId=")[1].split("&")[0]
-
-                            if not temp_item_id:
-                                temp_item_id = self.extract_item_id_from_message(message)
-                        except:
+                            from app.db_manager import db_manager
+                            existing_order = db_manager.get_order_by_id(order_id)
+                            if existing_order:
+                                existing_item = (existing_order.get('item_id') or '').strip()
+                                existing_buyer = (existing_order.get('buyer_id') or '').strip()
+                                if temp_item_id and db_manager.get_item_info(self.cookie_id, temp_item_id):
+                                    pass
+                                elif existing_item:
+                                    temp_item_id = existing_item
+                                if temp_user_id in ('', 'unknown_user') and existing_buyer:
+                                    temp_user_id = existing_buyer
+                        except Exception:
                             pass
 
                         # 交易卡片只提供订单号、商品、买家和状态，金额与数量必须走卖家端接口。
@@ -10236,45 +10414,15 @@ class XianyuLive:
             except Exception as e:
                 logger.error(f"【{self.cookie_id}】提取订单ID失败: {self._safe_str(e)}")
 
-            # 安全地获取用户ID
-            user_id = None
-            try:
-                message_1 = message.get("1")
-                if isinstance(message_1, str) and '@' in message_1:
-                    user_id = message_1.split('@')[0]
-                elif isinstance(message_1, dict):
-                    # 如果message['1']是字典，从message["1"]["10"]["senderUserId"]中提取user_id
-                    if "10" in message_1 and isinstance(message_1["10"], dict):
-                        user_id = message_1["10"].get("senderUserId", "unknown_user")
-                    else:
-                        user_id = "unknown_user"
-                else:
-                    user_id = "unknown_user"
-            except Exception as e:
-                logger.warning(f"提取用户ID失败: {self._safe_str(e)}")
+            # 安全地获取买家/商品 ID（优先 reminderUrl / senderUserId）
+            item_id, user_id = self._extract_message_identity(message)
+            if not user_id:
                 user_id = "unknown_user"
-
-
-
-            # 安全地提取商品ID
-            item_id = None
-            try:
-                if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
-                    url_info = message["1"]["10"].get("reminderUrl", "")
-                    if isinstance(url_info, str) and "itemId=" in url_info:
-                        item_id = url_info.split("itemId=")[1].split("&")[0]
-
-                # 如果没有提取到，使用辅助方法
-                if not item_id:
-                    item_id = self.extract_item_id_from_message(message)
-
-                if not item_id:
-                    item_id = f"auto_{user_id}_{int(time.time())}"
-                    logger.warning(f"无法提取商品ID，使用默认值: {item_id}")
-
-            except Exception as e:
-                logger.error(f"提取商品ID时发生错误: {self._safe_str(e)}")
+            if not item_id:
+                item_id = self.extract_item_id_from_message(message)
+            if not item_id:
                 item_id = f"auto_{user_id}_{int(time.time())}"
+                logger.warning(f"无法提取商品ID，使用默认值: {item_id}")
             # 处理订单状态消息
             try:
                 logger.info(message)
@@ -10307,31 +10455,52 @@ class XianyuLive:
 
             # 处理聊天消息
             try:
-                # 安全地提取聊天消息信息
-                if not (isinstance(message, dict) and "1" in message and isinstance(message["1"], dict)):
+                # 安全地提取聊天消息信息（兼容普通聊天和订单卡片更新两种结构）
+                if not isinstance(message, dict) or "1" not in message:
                     logger.error("消息格式错误：缺少必要的字段结构")
                     return
 
                 message_1 = message["1"]
-                if not isinstance(message_1.get("10"), dict):
-                    logger.error("消息格式错误：缺少消息详情字段")
+                if isinstance(message_1, dict):
+                    message_10 = message_1.get("10")
+                    if not isinstance(message_10, dict):
+                        logger.error("消息格式错误：缺少消息详情字段")
+                        return
+                    create_time = int(message_1.get("5", 0) or 0)
+                    send_user_name = message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
+                    send_user_id = message_10.get("senderUserId", "unknown")
+                    send_message = message_10.get("reminderContent", "")
+                    chat_id_raw = message_1.get("2", "")
+                elif self._is_card_update_message(message):
+                    message_4 = message["4"]
+                    create_time = int(message.get("5", 0) or message_4.get("5", 0) or 0)
+                    send_user_name = (
+                        message_4.get("senderNick")
+                        or message_4.get("reminderTitle")
+                        or "未知用户"
+                    )
+                    send_user_id = message_4.get("senderUserId", "unknown")
+                    send_message = (
+                        message_4.get("reminderContent")
+                        or message_4.get("detailNotice")
+                        or ""
+                    )
+                    chat_id_raw = message.get("2", "")
+                else:
+                    logger.error("消息格式错误：不支持的消息结构")
                     return
 
-                create_time = int(message_1.get("5", 0))
-                message_10 = message_1["10"]
-                send_user_name = message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
-                send_user_id = message_10.get("senderUserId", "unknown")
-                send_message = message_10.get("reminderContent", "")
-
-                chat_id_raw = message_1.get("2", "")
-                chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
+                chat_id = str(chat_id_raw).split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
 
             except Exception as e:
                 logger.error(f"提取聊天消息信息失败: {self._safe_str(e)}")
                 return
 
             # 格式化消息时间
-            msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(create_time/1000))
+            if create_time:
+                msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(create_time/1000))
+            else:
+                msg_time = time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 
@@ -10607,6 +10776,9 @@ class XianyuLive:
                             self.connection_failures = 0
                             self.last_successful_connection = time.time()
 
+                            # 重连后补一次待发货对账，覆盖断线期间漏掉的付款事件
+                            self._create_tracked_task(self._reconcile_pending_deliveries())
+
                             # 记录后台任务启动前的状态
                             logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}")
                             
@@ -10756,7 +10928,12 @@ class XianyuLive:
                     
                     # 对于连接关闭错误，使用警告级别而不是错误级别
                     if is_connection_closed:
-                        logger.warning(f"【{self.cookie_id}】WebSocket连接已关闭 ({self.connection_failures + 1}/{self.max_connection_failures})")
+                        self.ws_disconnect_count += 1
+                        logger.warning(
+                            f"【{self.cookie_id}】WebSocket连接已关闭 "
+                            f"(累计第 {self.ws_disconnect_count} 次，"
+                            f"{self.connection_failures + 1}/{self.max_connection_failures})"
+                        )
                         logger.warning(f"【{self.cookie_id}】关闭原因: {error_msg}")
                     else:
                         self.connection_failures += 1

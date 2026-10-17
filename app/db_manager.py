@@ -7,7 +7,7 @@ import random
 import string
 import io
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
@@ -7279,11 +7279,31 @@ class DBManager:
                         logger.warning(f"Cookie ID {cookie_id} 不存在于cookies表中，拒绝插入订单 {order_id}")
                         return False
 
-                # 检查订单是否已存在
-                cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
+                # 检查订单是否已存在（同时取出身份字段，防止坏值覆盖）
+                cursor.execute(
+                    "SELECT order_id, item_id, buyer_id FROM orders WHERE order_id = ?",
+                    (order_id,),
+                )
                 existing = cursor.fetchone()
 
                 if existing:
+                    existing_item_id = (existing[1] or '').strip()
+                    existing_buyer_id = (existing[2] or '').strip()
+
+                    # 消息解析失败时的 unknown_user / 非数字商品 ID 不能覆盖真实身份
+                    if buyer_id is not None:
+                        candidate_buyer = str(buyer_id).strip()
+                        if (
+                            candidate_buyer in ('', 'unknown_user')
+                            and existing_buyer_id
+                            and existing_buyer_id != 'unknown_user'
+                        ):
+                            buyer_id = None
+                    if item_id is not None:
+                        candidate_item = str(item_id).strip()
+                        if candidate_item.startswith('auto_') or not candidate_item.isdigit():
+                            item_id = None
+
                     # 更新现有订单
                     update_fields = []
                     update_values = []
@@ -7422,6 +7442,39 @@ class DBManager:
                 logger.error(f"插入或更新订单失败: {order_id} - {e}")
                 self.conn.rollback()
                 return False
+
+    def list_pending_delivery_orders(self, cookie_id: str, hours: int = 24,
+                                     limit: int = 5) -> List[Dict[str, Any]]:
+        """待补发订单：pending_ship 且没有卡密发货记录。
+
+        用于断线或消息漏收后的对账补发。只取最近 N 小时的订单，
+        避免把历史订单重新发一遍。
+        """
+        try:
+            cutoff = (
+                datetime.now() - timedelta(hours=max(1, int(hours or 24)))
+            ).strftime('%Y-%m-%d %H:%M:%S')
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT o.order_id, o.item_id, o.buyer_id, o.chat_id,
+                           o.order_status, o.created_at, o.updated_at
+                    FROM orders o
+                    WHERE o.cookie_id = ?
+                      AND o.order_status = 'pending_ship'
+                      AND o.created_at >= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM card_shipments s
+                          WHERE s.order_id = o.order_id
+                      )
+                    ORDER BY o.created_at ASC
+                    LIMIT ?
+                ''', (cookie_id, cutoff, max(1, int(limit or 5))))
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"读取待补发订单失败: {e}")
+            return []
 
     def get_order_by_id(self, order_id: str):
         """根据订单ID获取订单信息"""
