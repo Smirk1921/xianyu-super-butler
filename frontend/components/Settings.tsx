@@ -500,6 +500,83 @@ const Settings: React.FC = () => {
             </div>
           </section>
 
+          <section className="section-panel">
+            <SectionHeader
+              title="自动重新上架"
+              description="商品售完下架后，如果绑定的批量卡密还有库存，自动重新上架。默认只检查不执行。"
+              icon={RefreshCw}
+            />
+            <SettingToggle
+              title="启用自动重新上架检查"
+              description="总开关。关闭后所有商品都不会自动上架，商品行的逐项开关也不生效。"
+              checked={toBool(settings.auto_relist_enabled, false)}
+              onChange={() => setSettings({
+                ...settings,
+                auto_relist_enabled: !toBool(settings.auto_relist_enabled, false) ? 'true' : 'false',
+              })}
+            />
+            <SettingToggle
+              title="仅检查不执行（dry-run）"
+              description="开启时只在日志里记录满足条件的商品，不会真的点击上架。确认卖家页选择器稳定后再关闭。"
+              checked={toBool(settings.auto_relist_dry_run, true)}
+              onChange={() => setSettings({
+                ...settings,
+                auto_relist_dry_run: !toBool(settings.auto_relist_dry_run, true) ? 'true' : 'false',
+              })}
+            />
+            <div className="grid gap-4 p-4 sm:grid-cols-3">
+              <label>
+                <span className="field-label">检查间隔（分钟）</span>
+                <input
+                  type="number"
+                  value={Math.round(Number(settings.auto_relist_interval || 900) / 60)}
+                  onChange={(event) => {
+                    const minutes = parseInt(event.target.value, 10) || 15;
+                    setSettings({ ...settings, auto_relist_interval: minutes * 60 });
+                  }}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                  min="5"
+                  max="1440"
+                />
+                <span className="mt-1 block text-xs text-gray-500">最短 5 分钟。</span>
+              </label>
+              <label>
+                <span className="field-label">每次最多上架</span>
+                <input
+                  type="number"
+                  value={Number(settings.auto_relist_max_per_run || 3)}
+                  onChange={(event) => {
+                    const count = parseInt(event.target.value, 10) || 3;
+                    setSettings({ ...settings, auto_relist_max_per_run: count });
+                  }}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                  min="1"
+                  max="10"
+                />
+                <span className="mt-1 block text-xs text-gray-500">单次检查最多处理几个商品。</span>
+              </label>
+              <label>
+                <span className="field-label">同一商品冷却（分钟）</span>
+                <input
+                  type="number"
+                  value={Number(settings.auto_relist_cooldown_minutes || 60)}
+                  onChange={(event) => {
+                    const minutes = parseInt(event.target.value, 10) || 60;
+                    setSettings({ ...settings, auto_relist_cooldown_minutes: minutes });
+                  }}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                  min="5"
+                  max="1440"
+                />
+                <span className="mt-1 block text-xs text-gray-500">避免重复点击。</span>
+              </label>
+            </div>
+            <p className="px-4 pb-3 text-xs text-gray-500">
+              只有「批量」类型卡密有真实库存；固定文本、图片和 API 发卡无法判断余量，
+              不会参与自动上架。执行器需要先用探测脚本生成 relist_config.json。
+            </p>
+          </section>
+
         </div>
       )}
 

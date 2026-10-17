@@ -810,3 +810,7 @@ frontend/coverage/
 # Wrangler 本地缓存（Cloudflare Worker 部署产生）
 .wrangler/
 deploy/.wrangler/
+
+# 自动重新上架本地配置与页面快照（含账号页面信息，不入库）
+relist_config.json
+relist_probe.html

@@ -5,6 +5,7 @@ import {
   Edit,
   Loader2,
   ListChecks,
+  MessageSquare,
   PackageCheck,
   Plus,
   RefreshCw,
@@ -21,23 +22,32 @@ import {
   Card,
   Item,
   ItemDeliveryConfigSummary,
+  ItemReply,
+  ItemRelistSetting,
   ShippingRule,
 } from '../types';
 import {
   createManualItem,
   deleteItem,
+  deleteItemReply,
   deleteShippingRule,
   getAccountDetails,
   getCards,
   getItemDeliveryConfig,
   getItemDeliveryConfigs,
+  getItemReply,
+  getItemReplies,
+  getItemRelistSettings,
   getItems,
   getShippingRules,
   saveItemDeliveryConfig,
   polishItems,
+  runItemRelist,
   syncItemsFromAccount,
   updateItemDetail,
   updateItemMultiQuantity,
+  updateItemRelistSetting,
+  updateItemReply,
   updateShippingRule,
 } from '../services/api';
 import { confirmAction } from '../services/feedback';
@@ -208,6 +218,17 @@ const ItemList: React.FC = () => {
   const [showManualModal, setShowManualModal] = useState(false);
   const [manualForm, setManualForm] = useState<ManualItemForm>(emptyManualItem);
 
+  // 商品专属回复：key 为 `${cookie_id}:${item_id}`
+  const [itemReplies, setItemReplies] = useState<Record<string, ItemReply>>({});
+  const [replyItem, setReplyItem] = useState<Item | null>(null);
+  const [replyContent, setReplyContent] = useState('');
+  const [replyPriority, setReplyPriority] = useState(1);
+  const [replyLoading, setReplyLoading] = useState(false);
+  const [replySaving, setReplySaving] = useState(false);
+
+  // 商品级自动重新上架配置：key 同上
+  const [relistSettings, setRelistSettings] = useState<Record<string, ItemRelistSetting>>({});
+
   const accountNames = useMemo(
     () => new Map(accounts.map(account => [
       account.id,
@@ -304,6 +325,29 @@ const ItemList: React.FC = () => {
       setCards(cardData);
       setShippingRules(ruleData);
       setDeliveryConfigs(configData);
+
+      // 专属回复和自动上架配置都按账号拉取一次，供列表显示徽标和开关状态
+      const cookieIds = Array.from(new Set(itemData.map(item => item.cookie_id)));
+      const [replyLists, relistLists] = await Promise.all([
+        Promise.all(cookieIds.map(cookieId =>
+          getItemReplies(cookieId).catch(() => [] as ItemReply[]),
+        )),
+        Promise.all(cookieIds.map(cookieId =>
+          getItemRelistSettings(cookieId).catch(() => [] as ItemRelistSetting[]),
+        )),
+      ]);
+      const replyMap: Record<string, ItemReply> = {};
+      replyLists.flat().forEach(reply => {
+        replyMap[`${reply.cookie_id}:${reply.item_id}`] = reply;
+      });
+      setItemReplies(replyMap);
+
+      const relistMap: Record<string, ItemRelistSetting> = {};
+      relistLists.flat().forEach(setting => {
+        relistMap[`${setting.cookie_id}:${setting.item_id}`] = setting;
+      });
+      setRelistSettings(relistMap);
+
       setSelectedAccount(current => current || accountData[0]?.id || '');
     } catch (error) {
       setNotice({
@@ -440,6 +484,125 @@ const ItemList: React.FC = () => {
       setNotice({ type: 'success', message: '商品详情已保存' });
     } catch (error) {
       setNotice({ type: 'error', message: error instanceof Error ? error.message : '保存失败' });
+    } finally {
+      setSavingKey('');
+    }
+  };
+
+  const openReply = async (item: Item) => {
+    setReplyItem(item);
+    setReplyContent('');
+    setReplyPriority(1);
+    setReplyLoading(true);
+    try {
+      const data = await getItemReply(item.cookie_id, item.item_id);
+      if (data) {
+        setReplyContent(data.reply_content || '');
+        setReplyPriority(data.priority === 0 ? 0 : 1);
+      }
+    } catch (error) {
+      setNotice({ type: 'error', message: error instanceof Error ? error.message : '读取专属回复失败' });
+    } finally {
+      setReplyLoading(false);
+    }
+  };
+
+  const handleSaveReply = async () => {
+    if (!replyItem) return;
+    const content = replyContent.trim();
+    if (!content) {
+      setNotice({ type: 'error', message: '请填写回复内容' });
+      return;
+    }
+    setReplySaving(true);
+    try {
+      await updateItemReply(replyItem.cookie_id, replyItem.item_id, content, replyPriority);
+      const key = itemKey(replyItem);
+      setItemReplies(current => ({
+        ...current,
+        [key]: {
+          cookie_id: replyItem.cookie_id,
+          item_id: replyItem.item_id,
+          reply_content: content,
+          priority: replyPriority,
+        },
+      }));
+      setReplyItem(null);
+      setNotice({ type: 'success', message: '商品专属回复已保存' });
+    } catch (error) {
+      setNotice({ type: 'error', message: error instanceof Error ? error.message : '保存失败' });
+    } finally {
+      setReplySaving(false);
+    }
+  };
+
+  const handleDeleteReply = async () => {
+    if (!replyItem) return;
+    const confirmed = await confirmAction(
+      `删除「${replyItem.item_title || replyItem.item_id}」的专属回复？`,
+      { title: '删除专属回复', confirmLabel: '删除' },
+    );
+    if (!confirmed) return;
+    setReplySaving(true);
+    try {
+      await deleteItemReply(replyItem.cookie_id, replyItem.item_id);
+      const key = itemKey(replyItem);
+      setItemReplies(current => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      setReplyItem(null);
+      setNotice({ type: 'success', message: '专属回复已删除' });
+    } catch (error) {
+      setNotice({ type: 'error', message: error instanceof Error ? error.message : '删除失败' });
+    } finally {
+      setReplySaving(false);
+    }
+  };
+
+  const toggleAutoRelist = async (item: Item) => {
+    const key = itemKey(item);
+    const current = relistSettings[key];
+    const nextEnabled = !(current?.enabled === true || current?.enabled === 1);
+    setSavingKey(key);
+    try {
+      await updateItemRelistSetting(
+        item.cookie_id,
+        item.item_id,
+        nextEnabled,
+        current?.min_stock || 1,
+      );
+      setRelistSettings(previous => ({
+        ...previous,
+        [key]: {
+          ...(current || { cookie_id: item.cookie_id, item_id: item.item_id, min_stock: 1 }),
+          enabled: nextEnabled ? 1 : 0,
+        },
+      }));
+      setNotice({
+        type: 'success',
+        message: nextEnabled ? '已开启自动重新上架' : '已关闭自动重新上架',
+      });
+    } catch (error) {
+      setNotice({ type: 'error', message: error instanceof Error ? error.message : '设置失败' });
+    } finally {
+      setSavingKey('');
+    }
+  };
+
+  const handleRunRelist = async (item: Item) => {
+    setSavingKey(itemKey(item));
+    try {
+      const result = await runItemRelist(item.cookie_id, item.item_id);
+      setNotice({
+        type: result.success ? 'success' : 'error',
+        message: result.success
+          ? `资格检查通过：${result.message || '可以上架'}`
+          : `暂不能上架：${result.reason || '不满足条件'}`,
+      });
+    } catch (error) {
+      setNotice({ type: 'error', message: error instanceof Error ? error.message : '检查失败' });
     } finally {
       setSavingKey('');
     }
@@ -846,6 +1009,18 @@ const ItemList: React.FC = () => {
                                 已下架
                               </span>
                             )}
+                            {itemReplies[`${item.cookie_id}:${item.item_id}`] && (
+                              <span
+                                className="status-badge shrink-0 bg-blue-50 text-blue-600"
+                                title={
+                                  itemReplies[`${item.cookie_id}:${item.item_id}`].priority === 0
+                                    ? '已配置商品专属回复（仅兜底）'
+                                    : '已配置商品专属回复（优先回复）'
+                                }
+                              >
+                                专属回复
+                              </span>
+                            )}
                             <span className={`status-badge shrink-0 ${statusClass}`}>
                               {statusText}
                             </span>
@@ -938,6 +1113,23 @@ const ItemList: React.FC = () => {
                             onChange={() => toggleSetting(item, 'multi_quantity_delivery')}
                           />
                         </div>
+                        <div className="flex items-center justify-between gap-3">
+                          <span
+                            className="text-xs font-semibold text-gray-600"
+                            title="售完下架后，如果绑定的批量卡密还有库存，自动重新上架"
+                          >
+                            自动上架
+                          </span>
+                          <Toggle
+                            checked={
+                              relistSettings[key]?.enabled === true
+                              || relistSettings[key]?.enabled === 1
+                            }
+                            disabled={busy}
+                            label={`${item.item_title || item.item_id} 自动重新上架`}
+                            onChange={() => void toggleAutoRelist(item)}
+                          />
+                        </div>
                         {/* 详情状态属于「商品能力」而非「操作」，放在本列末尾，
                             避免和操作按钮挤在同一格造成表头与内容错位 */}
                         <div className="flex items-center justify-between gap-3">
@@ -950,6 +1142,28 @@ const ItemList: React.FC = () => {
 
                       <div className="flex items-center justify-end gap-1 border-t border-gray-100 pt-3 xl:!flex-row xl:items-center xl:justify-end xl:border-0 xl:pt-0">
                         <div className="flex items-center gap-1">
+                          {isOffShelf(item) && (
+                            <button
+                              type="button"
+                              onClick={() => void handleRunRelist(item)}
+                              disabled={busy}
+                              className="rounded-md p-2 text-green-600 hover:bg-green-50"
+                              title="检查并重新上架（当前为 dry-run，只做资格检查）"
+                              aria-label="检查并重新上架"
+                            >
+                              <RefreshCw className="h-4 w-4" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => void openReply(item)}
+                            disabled={busy}
+                            className="rounded-md p-2 text-blue-600 hover:bg-blue-50"
+                            title="商品专属回复"
+                            aria-label="商品专属回复"
+                          >
+                            <MessageSquare className="h-4 w-4" />
+                          </button>
                           <button
                             type="button"
                             onClick={() => openDetail(item)}
@@ -1319,7 +1533,95 @@ const ItemList: React.FC = () => {
                 disabled={Boolean(savingKey)}
                 className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2.5"
               >
-                {savingKey ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                <Save className="h-4 w-4" />
+                保存
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+
+      {replyItem && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container modal-container-lg">
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">商品专属回复</h3>
+                <p className="mt-1 line-clamp-1 text-sm text-gray-500">
+                  {replyItem.item_title || replyItem.item_id}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReplyItem(null)}
+                className="rounded-md p-2 hover:bg-gray-100"
+                aria-label="关闭"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="modal-body space-y-4">
+              {replyLoading ? (
+                <p className="py-6 text-center text-sm text-gray-500">正在读取回复配置...</p>
+              ) : (
+                <>
+                  <label className="block">
+                    <span className="field-label">回复内容</span>
+                    <textarea
+                      value={replyContent}
+                      onChange={event => setReplyContent(event.target.value)}
+                      rows={7}
+                      className="ios-input w-full resize-y rounded-md px-3 py-2.5"
+                      placeholder="买家在这个商品的会话里发消息时，优先回复这段内容。"
+                    />
+                    <p className="mt-1.5 text-xs text-gray-500">
+                      可用占位符：{'{send_user_name}'} 买家昵称、{'{send_user_id}'} 买家 ID、
+                      {' '}{'{send_message}'} 买家消息、{'{item_id}'} 商品 ID
+                    </p>
+                  </label>
+                  <label className="flex items-center justify-between gap-4 rounded-md border border-gray-200 px-3 py-2.5">
+                    <span>
+                      <span className="block text-sm font-bold text-gray-800">优先于关键词和 AI</span>
+                      <span className="mt-0.5 block text-xs text-gray-500">
+                        关闭后，只在关键词和 AI 都未命中时作为该商品的兜底回复。
+                      </span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={replyPriority === 1}
+                      onChange={event => setReplyPriority(event.target.checked ? 1 : 0)}
+                      className="h-4 w-4"
+                    />
+                  </label>
+                </>
+              )}
+            </div>
+            <div className="modal-footer flex flex-wrap justify-end gap-2">
+              {itemReplies[`${replyItem.cookie_id}:${replyItem.item_id}`] && (
+                <button
+                  type="button"
+                  onClick={() => void handleDeleteReply()}
+                  disabled={replySaving}
+                  className="rounded-md px-4 py-2.5 text-sm font-bold text-red-600 hover:bg-red-50"
+                >
+                  删除回复
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setReplyItem(null)}
+                className="ios-btn-secondary rounded-md px-4 py-2.5"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSaveReply()}
+                disabled={replySaving || replyLoading}
+                className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2.5"
+              >
+                {replySaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                 保存
               </button>
             </div>

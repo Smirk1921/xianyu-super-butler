@@ -1,0 +1,246 @@
+"""商品自动重新上架的资格判断测试。
+
+覆盖：
+- 批量卡密库存充足/不足
+- 固定文本、图片、API 卡密无法判断库存，不参与自动上架
+- 卡密停用、未绑定、多规格严格模式
+- 旧版 delivery_rules 的库存判断
+- 冷却、pending、手动商品等资格过滤
+- 商品级开关的 upsert 和候选查询
+"""
+
+import os
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+
+from app.db_manager import DBManager
+from app.item_relist import ItemRelistService
+
+
+class ItemRelistTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manager = DBManager(os.path.join(self.temp_dir.name, "relist.db"))
+        self.user_id = self.manager.conn.execute(
+            "SELECT id FROM users WHERE username='admin'"
+        ).fetchone()[0]
+        cursor = self.manager.conn.cursor()
+        cursor.execute(
+            "INSERT INTO cookies (id, value, user_id) VALUES ('acc', 'cookie', ?)",
+            (self.user_id,),
+        )
+        # 批量卡密：3 条库存
+        cursor.execute(
+            "INSERT INTO cards (id, name, type, data_content, enabled, user_id) "
+            "VALUES (1, '批量卡', 'data', ?, 1, ?)",
+            ("k1\nk2\nk3", self.user_id),
+        )
+        # 固定文本卡密
+        cursor.execute(
+            "INSERT INTO cards (id, name, type, text_content, enabled, user_id) "
+            "VALUES (2, '文本卡', 'text', 'hello', 1, ?)",
+            (self.user_id,),
+        )
+        # 停用的批量卡密
+        cursor.execute(
+            "INSERT INTO cards (id, name, type, data_content, enabled, user_id) "
+            "VALUES (3, '停用卡', 'data', ?, 0, ?)",
+            ("x1\nx2", self.user_id),
+        )
+        self.manager.conn.commit()
+        self.service = ItemRelistService(self.manager)
+
+    def tearDown(self):
+        self.manager.close()
+        self.temp_dir.cleanup()
+
+    def _add_item(self, item_id, listing_status="off_shelf", last_seen="2026-10-17 00:00:00"):
+        self.manager.conn.execute(
+            "INSERT INTO item_info (cookie_id, item_id, item_title, listing_status, last_seen_at) "
+            "VALUES ('acc', ?, ?, ?, ?)",
+            (item_id, f"商品 {item_id}", listing_status, last_seen),
+        )
+        self.manager.conn.commit()
+
+    def _bind_variant(self, item_id, card_id, delivery_count=1, enabled=1):
+        cursor = self.manager.conn.cursor()
+        cursor.execute(
+            "INSERT INTO item_delivery_configs "
+            "(user_id, cookie_id, item_id, enabled, is_multi_spec) VALUES (?, 'acc', ?, 1, 0)",
+            (self.user_id, item_id),
+        )
+        cursor.execute(
+            "INSERT INTO product_variants "
+            "(user_id, cookie_id, item_id, display_name, platform_sku_id, "
+            " spec_payload_json, canonical_spec_key, source, enabled) "
+            "VALUES (?, 'acc', ?, '默认', '', '{}', 'default', 'manual', 1)",
+            (self.user_id, item_id),
+        )
+        variant_id = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO variant_delivery_bindings "
+            "(user_id, variant_id, card_id, delivery_count, enabled) VALUES (?, ?, ?, ?, ?)",
+            (self.user_id, variant_id, card_id, delivery_count, enabled),
+        )
+        self.manager.conn.commit()
+
+    def _add_legacy_rule(self, item_id, card_id, delivery_count=1):
+        self.manager.conn.execute(
+            "INSERT INTO delivery_rules "
+            "(keyword, card_id, delivery_count, enabled, description, user_id, cookie_id, item_id) "
+            "VALUES ('', ?, ?, 1, '', ?, 'acc', ?)",
+            (card_id, delivery_count, self.user_id, item_id),
+        )
+        self.manager.conn.commit()
+
+    # ------------------------------------------------------------------
+    # 库存判断
+    # ------------------------------------------------------------------
+    def test_data_card_with_stock_is_eligible(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 1)
+        result = self.service.evaluate_stock("acc", "1001", self.user_id, 1)
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["details"][0]["stock"], 3)
+
+    def test_data_card_without_enough_stock_is_rejected(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 1, delivery_count=2)
+        result = self.service.evaluate_stock("acc", "1001", self.user_id, 2)
+        self.assertFalse(result["eligible"])
+        self.assertIn("库存不足", result["reason"])
+
+    def test_text_card_cannot_be_evaluated(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 2)
+        result = self.service.evaluate_stock("acc", "1001", self.user_id, 1)
+        self.assertFalse(result["eligible"])
+        self.assertIn("无法判断库存", result["reason"])
+
+    def test_disabled_card_is_rejected(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 3)
+        result = self.service.evaluate_stock("acc", "1001", self.user_id, 1)
+        self.assertFalse(result["eligible"])
+        self.assertIn("已停用", result["reason"])
+
+    def test_no_binding_is_rejected(self):
+        self._add_item("1001")
+        result = self.service.evaluate_stock("acc", "1001", self.user_id, 1)
+        self.assertFalse(result["eligible"])
+        self.assertIn("没有绑定", result["reason"])
+
+    def test_legacy_rule_data_card(self):
+        self._add_item("2002")
+        self._add_legacy_rule("2002", 1, delivery_count=1)
+        result = self.service.evaluate_stock("acc", "2002", self.user_id, 1)
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["source"], "rule")
+
+    # ------------------------------------------------------------------
+    # 资格过滤
+    # ------------------------------------------------------------------
+    def test_manual_item_without_last_seen_is_rejected(self):
+        self._add_item("1001", last_seen=None)
+        self._bind_variant("1001", 1)
+        candidate = {
+            "cookie_id": "acc",
+            "item_id": "1001",
+            "listing_status": "off_shelf",
+            "last_seen_at": None,
+            "last_attempt_at": None,
+            "min_stock": 1,
+        }
+        result = self.service.check_eligibility(candidate, self.user_id)
+        self.assertFalse(result["eligible"])
+        self.assertIn("手动添加", result["reason"])
+
+    def test_pending_status_is_rejected(self):
+        candidate = {
+            "cookie_id": "acc",
+            "item_id": "1001",
+            "listing_status": "on_sale_pending",
+            "last_seen_at": "2026-10-17 00:00:00",
+            "last_attempt_at": None,
+            "min_stock": 1,
+        }
+        result = self.service.check_eligibility(candidate, self.user_id)
+        self.assertFalse(result["eligible"])
+        self.assertIn("等待同步确认", result["reason"])
+
+    def test_cooldown_blocks_recent_attempt(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 1)
+        recent = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        candidate = {
+            "cookie_id": "acc",
+            "item_id": "1001",
+            "listing_status": "off_shelf",
+            "last_seen_at": "2026-10-17 00:00:00",
+            "last_attempt_at": recent,
+            "min_stock": 1,
+        }
+        result = self.service.check_eligibility(candidate, self.user_id, cooldown_minutes=60)
+        self.assertFalse(result["eligible"])
+        self.assertIn("冷却中", result["reason"])
+
+    def test_eligible_candidate_passes(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 1)
+        candidate = {
+            "cookie_id": "acc",
+            "item_id": "1001",
+            "listing_status": "off_shelf",
+            "last_seen_at": "2026-10-17 00:00:00",
+            "last_attempt_at": None,
+            "min_stock": 1,
+        }
+        result = self.service.check_eligibility(candidate, self.user_id)
+        self.assertTrue(result["eligible"])
+
+    # ------------------------------------------------------------------
+    # 配置与记录
+    # ------------------------------------------------------------------
+    def test_upsert_setting_and_candidate_query(self):
+        self._add_item("1001")
+        self.assertTrue(
+            self.manager.upsert_item_relist_setting(self.user_id, "acc", "1001", True, 1)
+        )
+        candidates = self.manager.list_item_relist_candidates(self.user_id, "acc")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["item_id"], "1001")
+        self.assertEqual(candidates[0]["enabled"], 1)
+
+        # 关闭后不再出现在候选里
+        self.manager.upsert_item_relist_setting(self.user_id, "acc", "1001", False, 1)
+        self.assertEqual(self.manager.list_item_relist_candidates(self.user_id, "acc"), [])
+
+    def test_record_attempt_updates_counter(self):
+        self._add_item("1001")
+        self.manager.upsert_item_relist_setting(self.user_id, "acc", "1001", True, 1)
+        self.manager.record_item_relist_attempt(
+            self.user_id, "acc", "1001", "failed", "测试失败"
+        )
+        setting = self.manager.get_item_relist_setting(self.user_id, "acc", "1001")
+        self.assertEqual(setting["last_result"], "failed")
+        self.assertEqual(setting["last_reason"], "测试失败")
+        self.assertEqual(setting["attempts_today"], 1)
+
+    def test_mark_listing_pending(self):
+        self._add_item("1001")
+        self.assertTrue(self.manager.set_item_listing_pending("acc", "1001"))
+        item = self.manager.get_item_info("acc", "1001")
+        self.assertEqual(item["listing_status"], "on_sale_pending")
+
+    def test_list_candidates_attaches_eligibility(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 1)
+        self.manager.upsert_item_relist_setting(self.user_id, "acc", "1001", True, 1)
+        rows = self.service.list_candidates(self.user_id, "acc")
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["eligible"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -299,6 +299,9 @@ class XianyuLive:
         if self.item_polish_task:
             status = "已完成" if self.item_polish_task.done() else "运行中"
             other_tasks_status.append(f"商品擦亮任务({status})")
+        if self.item_relist_task:
+            status = "已完成" if self.item_relist_task.done() else "运行中"
+            other_tasks_status.append(f"自动重新上架任务({status})")
         if self.delivery_timeout_task:
             status = "已完成" if self.delivery_timeout_task.done() else "运行中"
             other_tasks_status.append(f"发货超时检查({status})")
@@ -361,6 +364,12 @@ class XianyuLive:
                 else:
                     logger.debug(f"【{self.cookie_id}】商品擦亮任务已完成，跳过")
 
+            if self.item_relist_task:
+                if not self.item_relist_task.done():
+                    tasks_to_cancel.append(("自动重新上架任务", self.item_relist_task))
+                else:
+                    logger.debug(f"【{self.cookie_id}】自动重新上架任务已完成，跳过")
+
             if self.delivery_timeout_task:
                 if not self.delivery_timeout_task.done():
                     tasks_to_cancel.append(("发货超时检查", self.delivery_timeout_task))
@@ -383,6 +392,7 @@ class XianyuLive:
                 self.item_sync_task = None
                 self.order_sync_task = None
                 self.item_polish_task = None
+                self.item_relist_task = None
                 self.delivery_timeout_task = None
                 self.buyer_interaction_task = None
                 return
@@ -522,6 +532,7 @@ class XianyuLive:
             self.item_sync_task = None
             self.order_sync_task = None
             self.item_polish_task = None
+            self.item_relist_task = None
             self.delivery_timeout_task = None
             self.buyer_interaction_task = None
             logger.info(f"【{self.cookie_id}】后台任务引用已全部重置")
@@ -818,6 +829,10 @@ class XianyuLive:
         # 商品擦亮定时任务：重新获取搜索曝光，默认关闭
         self.item_polish_task = None
         self.last_polish_time = 0
+
+        # 售完下架后按卡密余量自动重新上架，默认关闭且默认 dry-run
+        self.item_relist_task = None
+        self.last_item_relist_check_time = 0
 
         # 发货超时告警：记录已提醒过的订单，避免重复推送
         self.delivery_timeout_task = None
@@ -4389,10 +4404,15 @@ class XianyuLive:
         try:
             from app.db_manager import db_manager
 
-            # 1. 优先检查指定商品回复
+            # 1. 优先检查指定商品回复（仅 priority=0 的兜底模式；
+            #    priority=1 的专属回复已在消息处理入口直接处理）
             if item_id:
                 item_reply = db_manager.get_item_reply(self.cookie_id, item_id)
-                if item_reply and item_reply.get('reply_content'):
+                if (
+                    item_reply
+                    and item_reply.get('reply_content')
+                    and int(item_reply.get('priority') or 1) == 0
+                ):
                     reply_content = item_reply['reply_content']
                     logger.info(f"【{self.cookie_id}】使用指定商品回复: 商品ID={item_id}")
 
@@ -4437,17 +4457,11 @@ class XianyuLive:
 
             # 进行变量替换
             try:
-                # 获取当前商品是否有设置自动回复
-                item_replay = db_manager.get_item_replay(item_id)
-
                 formatted_reply = reply_content.format(
                     send_user_name=send_user_name,
                     send_user_id=send_user_id,
                     send_message=send_message
                 ) if reply_content else ''
-
-                if item_replay:
-                    formatted_reply = item_replay.get('reply_content', '')
 
                 # 如果开启了"只回复一次"功能，记录这次回复
                 if default_reply_settings.get('reply_once', False) and chat_id:
@@ -7390,6 +7404,153 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】商品擦亮循环已退出")
 
 
+    async def item_relist_loop(self):
+        """售完下架后按卡密余量自动重新上架。
+
+        设计约束：
+        - 默认关闭，且默认 dry-run，只记录候选，不真正点击；
+        - 逐商品开启，避免把手动下架/违规下架的商品重新挂上去；
+        - 只对 data 卡判断库存，text/api/image 无法确认余量；
+        - 与擦亮一致：随机错峰、风控冷却、可中断睡眠。
+        """
+        await self._interruptible_sleep(random.uniform(0, 180))
+        try:
+            while True:
+                try:
+                    from app.cookie_manager import manager as cookie_manager
+                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                        logger.info(f"【{self.cookie_id}】账号已禁用，停止自动重新上架循环")
+                        break
+
+                    from app.db_manager import db_manager
+                    enabled = str(
+                        db_manager.get_system_setting('auto_relist_enabled') or ''
+                    ).strip().lower() in ('1', 'true', 'yes')
+                    if not enabled:
+                        await self._interruptible_sleep(120)
+                        continue
+
+                    try:
+                        interval = int(db_manager.get_system_setting('auto_relist_interval') or 900)
+                    except (TypeError, ValueError):
+                        interval = 900
+                    interval = max(300, interval)
+
+                    try:
+                        max_per_run = int(
+                            db_manager.get_system_setting('auto_relist_max_per_run') or 3
+                        )
+                    except (TypeError, ValueError):
+                        max_per_run = 3
+                    max_per_run = max(1, min(10, max_per_run))
+
+                    try:
+                        cooldown = int(
+                            db_manager.get_system_setting('auto_relist_cooldown_minutes') or 60
+                        )
+                    except (TypeError, ValueError):
+                        cooldown = 60
+
+                    dry_run = str(
+                        db_manager.get_system_setting('auto_relist_dry_run') or 'true'
+                    ).strip().lower() in ('1', 'true', 'yes')
+
+                    # 风控冷却期内不发任何主动请求
+                    from utils import risk_control
+                    guard = risk_control.registry.get(self.cookie_id)
+                    if guard.is_blocked:
+                        wait = min(guard.remaining_seconds + 5, 300)
+                        logger.debug(
+                            f"【{self.cookie_id}】风控冷却中，{wait} 秒后再检查自动上架"
+                        )
+                        await self._interruptible_sleep(wait)
+                        continue
+
+                    user_id = self.user_id
+                    if not user_id:
+                        details = db_manager.get_cookie_details(self.cookie_id) or {}
+                        user_id = details.get('user_id')
+
+                    from app.item_relist import ItemRelistService
+                    service = ItemRelistService(db_manager)
+                    candidates = service.list_candidates(
+                        user_id, self.cookie_id, cooldown_minutes=cooldown
+                    )
+                    eligible = [item for item in candidates if item.get('eligible')]
+                    if eligible:
+                        logger.info(
+                            f"【{self.cookie_id}】自动上架检查: 候选 {len(candidates)} 个，"
+                            f"可上架 {len(eligible)} 个"
+                        )
+
+                    for candidate in eligible[:max_per_run]:
+                        item_id = candidate.get('item_id')
+                        if dry_run:
+                            logger.info(
+                                f"【{self.cookie_id}】[dry-run] 商品 {item_id} 满足上架条件，"
+                                f"库存={candidate.get('stock')}"
+                            )
+                            service.record_attempt(
+                                user_id, self.cookie_id, item_id, 'dry_run', '仅检查，未执行'
+                            )
+                            continue
+
+                        try:
+                            from utils.item_relist import relist_item
+                            details = db_manager.get_cookie_details(self.cookie_id) or {}
+                            result = await relist_item(
+                                self.cookie_id,
+                                self.cookies_str,
+                                item_id,
+                                headless=not bool(details.get('show_browser')),
+                            )
+                        except Exception as relist_error:
+                            logger.error(
+                                f"【{self.cookie_id}】商品 {item_id} 重新上架异常: "
+                                f"{self._safe_str(relist_error)}"
+                            )
+                            service.record_attempt(
+                                user_id, self.cookie_id, item_id, 'failed',
+                                self._safe_str(relist_error),
+                            )
+                            continue
+
+                        if result.get('success'):
+                            db_manager.set_item_listing_pending(self.cookie_id, item_id)
+                            service.record_attempt(
+                                user_id, self.cookie_id, item_id, 'success',
+                                result.get('message', ''),
+                            )
+                            logger.info(f"【{self.cookie_id}】商品 {item_id} 已重新上架")
+                        else:
+                            service.record_attempt(
+                                user_id, self.cookie_id, item_id, 'failed',
+                                result.get('reason', ''),
+                            )
+                            logger.warning(
+                                f"【{self.cookie_id}】商品 {item_id} 重新上架失败: "
+                                f"{result.get('reason', '')}"
+                            )
+
+                    self.last_item_relist_check_time = time.time()
+                    await self._interruptible_sleep(interval)
+
+                except asyncio.CancelledError:
+                    logger.info(f"【{self.cookie_id}】自动重新上架循环收到取消信号，准备退出")
+                    raise
+                except Exception as e:
+                    logger.error(f"【{self.cookie_id}】自动重新上架任务失败: {self._safe_str(e)}")
+                    try:
+                        await self._interruptible_sleep(120)
+                    except asyncio.CancelledError:
+                        raise
+        except asyncio.CancelledError:
+            logger.info(f"【{self.cookie_id}】自动重新上架循环已取消，正在退出...")
+            raise
+        finally:
+            logger.info(f"【{self.cookie_id}】自动重新上架循环已退出")
+
+
     async def delivery_timeout_loop(self):
         """发货超时告警。
 
@@ -9561,8 +9722,42 @@ class XianyuLive:
             reply = None
             reply_strategy = "none"
             matched_keyword = None
-            # 判断是否启用API回复
-            if AUTO_REPLY.get('api', {}).get('enabled', False):
+            reply_source = 'API'  # 默认假设是API回复
+
+            # 0. 商品专属回复：priority=1 时优先于 API、关键词和 AI。
+            #    每个商品一段固定文本，支持 {send_user_name}/{send_user_id}/{send_message}/{item_id}。
+            try:
+                item_reply = db_manager.get_item_reply(self.cookie_id, item_id) if item_id else None
+                raw_item_reply = (item_reply or {}).get('reply_content') or ''
+                if (
+                    item_reply
+                    and raw_item_reply.strip()
+                    and int(item_reply.get('priority') or 1) == 1
+                ):
+                    try:
+                        reply = raw_item_reply.format(
+                            send_user_name=send_user_name,
+                            send_user_id=send_user_id,
+                            send_message=send_message,
+                            item_id=item_id,
+                        )
+                    except Exception as format_error:
+                        logger.warning(
+                            f"【{self.cookie_id}】商品专属回复变量替换失败，使用原文: "
+                            f"{self._safe_str(format_error)}"
+                        )
+                        reply = raw_item_reply
+                    reply_strategy = "item"
+                    reply_source = "专属"
+                    logger.info(f"【{self.cookie_id}】使用商品专属回复: 商品ID={item_id}")
+            except Exception as item_reply_error:
+                logger.warning(
+                    f"【{self.cookie_id}】读取商品专属回复失败: "
+                    f"{self._safe_str(item_reply_error)}"
+                )
+
+            # 判断是否启用API回复（商品专属回复已命中时不再调用）
+            if not reply and AUTO_REPLY.get('api', {}).get('enabled', False):
                 reply = await self.get_api_reply(
                     msg_time, user_url, send_user_id, send_user_name,
                     item_id, send_message, chat_id
@@ -9572,10 +9767,7 @@ class XianyuLive:
                 if not reply:
                     logger.error(f"[{msg_time}] 【API调用失败】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
 
-            # 记录回复来源
-            reply_source = 'API'  # 默认假设是API回复
-
-            # 如果API回复失败或未启用API，按新的优先级顺序处理
+            # 如果以上都未命中，按关键词 -> AI -> 默认回复处理
             if not reply:
                 # 1. 首先尝试关键词匹配（传入商品ID）
                 reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
@@ -10437,6 +10629,14 @@ class XianyuLive:
                                 tasks_started.append("商品擦亮")
                             else:
                                 logger.info(f"【{self.cookie_id}】商品擦亮任务已在运行，跳过启动")
+
+                            # 启动自动重新上架任务（是否真正执行由设置开关决定）
+                            if not self.item_relist_task or self.item_relist_task.done():
+                                logger.info(f"【{self.cookie_id}】启动自动重新上架任务...")
+                                self.item_relist_task = asyncio.create_task(self.item_relist_loop())
+                                tasks_started.append("自动重新上架")
+                            else:
+                                logger.info(f"【{self.cookie_id}】自动重新上架任务已在运行，跳过启动")
 
                             # 启动发货超时检查：超时未发货会被平台处罚
                             if not self.delivery_timeout_task or self.delivery_timeout_task.done():

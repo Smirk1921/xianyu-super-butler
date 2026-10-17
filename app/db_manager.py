@@ -7,6 +7,7 @@ import random
 import string
 import io
 import base64
+from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
@@ -798,15 +799,42 @@ class DBManager:
                     logger.warning(f"添加 reply_image_url 字段失败: {e}")
 
             # 创建指定商品回复表
+            # priority=1 表示命中该商品时优先回复；0 表示仅作为关键词/AI 都未命中后的兜底
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS item_replay (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id TEXT NOT NULL,
                     cookie_id TEXT NOT NULL,
                     reply_content TEXT NOT NULL ,
+                    priority INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(cookie_id, item_id)
                 )
+            ''')
+
+            # 商品自动重新上架配置：逐商品开启，避免误上架手动下架/违规下架的商品
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS item_relist_settings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 1,
+                    cookie_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    enabled INTEGER DEFAULT 0,
+                    min_stock INTEGER DEFAULT 1,
+                    last_attempt_at TIMESTAMP,
+                    last_result TEXT DEFAULT '',
+                    last_reason TEXT DEFAULT '',
+                    attempts_today INTEGER DEFAULT 0,
+                    attempt_date TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, cookie_id, item_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_item_relist_cookie_enabled
+                ON item_relist_settings(cookie_id, enabled)
             ''')
 
             # 创建默认回复记录表（记录已回复的chat_id）
@@ -1092,6 +1120,46 @@ class DBManager:
             if 'item_sync_max_pages' not in existing_keys:
                 logger.info("添加商品同步配置：item_sync_max_pages...")
                 cursor.execute("INSERT INTO system_settings (key, value, description) VALUES ('item_sync_max_pages', '5', '每次最多同步的页数')")
+
+            # item_replay：补充 priority 列、去重并建立 (cookie_id, item_id) 唯一索引。
+            # 旧库没有唯一约束，重复行会让 get_item_reply 的 fetchone 结果不确定。
+            cursor.execute("PRAGMA table_info(item_replay)")
+            item_replay_columns = [column[1] for column in cursor.fetchall()]
+            if 'priority' not in item_replay_columns:
+                logger.info("添加item_replay表的priority列...")
+                cursor.execute("ALTER TABLE item_replay ADD COLUMN priority INTEGER DEFAULT 1")
+            cursor.execute('''
+                DELETE FROM item_replay
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM item_replay GROUP BY cookie_id, item_id
+                )
+            ''')
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_item_replay_cookie_item
+                ON item_replay(cookie_id, item_id)
+            ''')
+
+            # 自动重新上架默认配置：默认关闭，逐商品开启后才生效
+            relist_defaults = {
+                'auto_relist_enabled': ('false', '是否启用自动重新上架'),
+                'auto_relist_dry_run': ('true', '自动重新上架只检查不执行'),
+                'auto_relist_interval': ('900', '自动重新上架检查间隔（秒）'),
+                'auto_relist_max_per_run': ('3', '每次检查最多上架的商品数'),
+                'auto_relist_cooldown_minutes': ('60', '同一商品两次上架尝试的最小间隔（分钟）'),
+            }
+            cursor.execute(
+                "SELECT key FROM system_settings WHERE key IN ({})".format(
+                    ','.join('?' for _ in relist_defaults)
+                ),
+                tuple(relist_defaults.keys()),
+            )
+            existing_relist_keys = {row[0] for row in cursor.fetchall()}
+            for key, (value, description) in relist_defaults.items():
+                if key not in existing_relist_keys:
+                    cursor.execute(
+                        "INSERT INTO system_settings (key, value, description) VALUES (?, ?, ?)",
+                        (key, value, description),
+                    )
 
         except Exception as e:
             logger.error(f"数据库迁移失败: {e}")
@@ -7619,29 +7687,32 @@ class DBManager:
         except Exception as e:
             logger.error(f"升级keywords表失败: {e}")
             raise
-    def get_item_replay(self, item_id: str) -> Optional[Dict[str, Any]]:
+    def get_item_replay(self, item_id: str, cookie_id: str = None) -> Optional[Dict[str, Any]]:
         """
-        根据商品ID获取商品回复信息，并返回统一格式
+        根据商品ID获取商品回复信息，并返回统一格式。
 
-        Args:
-            item_id (str): 商品ID
-
-        Returns:
-            Optional[Dict[str, Any]]: 商品回复信息字典（统一格式），找不到返回 None
+        cookie_id 可选：传了就按账号隔离查询；不传只按 item_id 查，
+        仅用于兼容旧调用，新代码应始终传 cookie_id，避免跨账号串回复。
         """
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                    SELECT reply_content FROM item_replay
-                    WHERE item_id = ?
-                ''', (item_id,))
+                if cookie_id:
+                    cursor.execute('''
+                        SELECT reply_content, priority FROM item_replay
+                        WHERE cookie_id = ? AND item_id = ?
+                    ''', (cookie_id, item_id))
+                else:
+                    cursor.execute('''
+                        SELECT reply_content, priority FROM item_replay
+                        WHERE item_id = ?
+                    ''', (item_id,))
 
                 row = cursor.fetchone()
                 if row:
-                    (reply_content,) = row
                     return {
-                        'reply_content': reply_content or ''
+                        'reply_content': row[0] or '',
+                        'priority': row[1] if row[1] is not None else 1,
                     }
                 return None
         except Exception as e:
@@ -7657,13 +7728,13 @@ class DBManager:
             item_id (str): 商品ID
 
         Returns:
-            Dict: 包含回复内容的字典，如果不存在返回None
+            Dict: 包含回复内容、优先级和时间戳的字典，如果不存在返回None
         """
         try:
             with self.lock:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                    SELECT reply_content, created_at, updated_at
+                    SELECT reply_content, priority, created_at, updated_at
                     FROM item_replay
                     WHERE cookie_id = ? AND item_id = ?
                 ''', (cookie_id, item_id))
@@ -7672,22 +7743,25 @@ class DBManager:
                 if row:
                     return {
                         'reply_content': row[0] or '',
-                        'created_at': row[1],
-                        'updated_at': row[2]
+                        'priority': row[1] if row[1] is not None else 1,
+                        'created_at': row[2],
+                        'updated_at': row[3]
                     }
                 return None
         except Exception as e:
             logger.error(f"获取指定商品回复失败: {e}")
             return None
 
-    def update_item_reply(self, cookie_id: str, item_id: str, reply_content: str) -> bool:
+    def update_item_reply(self, cookie_id: str, item_id: str, reply_content: str,
+                          priority: int = 1) -> bool:
         """
-        更新指定cookie和item的回复内容及更新时间
+        更新指定cookie和item的回复内容及更新时间（原子 upsert）
 
         Args:
             cookie_id (str): 账号ID
             item_id (str): 商品ID
             reply_content (str): 回复内容
+            priority (int): 1=命中该商品时优先回复，0=仅作为兜底
 
         Returns:
             bool: 更新成功返回True，失败返回False
@@ -7696,40 +7770,43 @@ class DBManager:
             with self.lock:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                    UPDATE item_replay
-                    SET reply_content = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE cookie_id = ? AND item_id = ?
-                ''', (reply_content, cookie_id, item_id))
-
-                if cursor.rowcount == 0:
-                    # 如果没更新到，说明该条记录不存在，可以考虑插入
-                    cursor.execute('''
-                        INSERT INTO item_replay (item_id, cookie_id, reply_content, created_at, updated_at)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    ''', (item_id, cookie_id, reply_content))
+                    INSERT INTO item_replay
+                        (item_id, cookie_id, reply_content, priority, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(cookie_id, item_id) DO UPDATE SET
+                        reply_content = excluded.reply_content,
+                        priority = excluded.priority,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (item_id, cookie_id, reply_content, 1 if priority else 0))
 
                 self.conn.commit()
             return True
         except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             logger.error(f"更新商品回复失败: {e}")
             return False
 
     def get_itemReplays_by_cookie(self, cookie_id: str) -> List[Dict]:
-        """获取指定Cookie的所有商品信息
+        """获取指定Cookie的所有商品回复
 
         Args:
             cookie_id: Cookie ID
 
         Returns:
-            List[Dict]: 商品信息列表
+            List[Dict]: 商品回复列表，包含 priority 和商品标题
         """
         try:
             with self.lock:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT r.item_id, r.cookie_id, r.reply_content, r.created_at, r.updated_at, i.item_title, i.item_detail
+                SELECT r.item_id, r.cookie_id, r.reply_content, r.priority,
+                       r.created_at, r.updated_at, i.item_title, i.item_detail
                     FROM item_replay r
-                    LEFT JOIN item_info i ON i.item_id = r.item_id
+                    LEFT JOIN item_info i
+                      ON i.item_id = r.item_id AND i.cookie_id = r.cookie_id
                     WHERE r.cookie_id = ?
                     ORDER BY r.updated_at DESC
                 ''', (cookie_id,))
@@ -7739,7 +7816,8 @@ class DBManager:
 
                 for row in cursor.fetchall():
                     item_info = dict(zip(columns, row))
-
+                    if item_info.get('priority') is None:
+                        item_info['priority'] = 1
                     items.append(item_info)
 
                 return items
@@ -7810,6 +7888,179 @@ class DBManager:
             return {"success_count": 0, "failed_count": len(items)}
 
         return {"success_count": success_count, "failed_count": failed_count}
+
+    # ==================== 商品自动重新上架 ====================
+
+    def get_item_relist_setting(self, user_id: int, cookie_id: str,
+                                item_id: str) -> Optional[Dict[str, Any]]:
+        """读取单个商品的自动重新上架配置。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM item_relist_settings
+                    WHERE user_id = ? AND cookie_id = ? AND item_id = ?
+                ''', (user_id, cookie_id, item_id))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [description[0] for description in cursor.description]
+                return dict(zip(columns, row))
+        except Exception as e:
+            logger.error(f"读取自动上架配置失败: {e}")
+            return None
+
+    def upsert_item_relist_setting(self, user_id: int, cookie_id: str, item_id: str,
+                                   enabled: bool, min_stock: int = 1) -> bool:
+        """保存商品级自动重新上架开关。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO item_relist_settings
+                        (user_id, cookie_id, item_id, enabled, min_stock,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id, cookie_id, item_id) DO UPDATE SET
+                        enabled = excluded.enabled,
+                        min_stock = excluded.min_stock,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (
+                    user_id, cookie_id, item_id,
+                    1 if enabled else 0,
+                    max(1, int(min_stock or 1)),
+                ))
+                self.conn.commit()
+            return True
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"保存自动上架配置失败: {e}")
+            return False
+
+    def list_item_relist_settings(self, user_id: int,
+                                  cookie_id: str = None) -> List[Dict[str, Any]]:
+        """列出当前用户的自动重新上架配置。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                sql = '''
+                    SELECT s.*, i.item_title, i.listing_status, i.last_seen_at
+                    FROM item_relist_settings s
+                    LEFT JOIN item_info i
+                      ON i.cookie_id = s.cookie_id AND i.item_id = s.item_id
+                    WHERE s.user_id = ?
+                '''
+                params: List[Any] = [user_id]
+                if cookie_id:
+                    sql += " AND s.cookie_id = ?"
+                    params.append(cookie_id)
+                sql += " ORDER BY s.updated_at DESC"
+                cursor.execute(sql, params)
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"列出自动上架配置失败: {e}")
+            return []
+
+    def list_item_relist_candidates(self, user_id: int,
+                                    cookie_id: str = None) -> List[Dict[str, Any]]:
+        """列出已开启自动上架且当前处于下架状态的商品。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                sql = '''
+                    SELECT i.cookie_id, i.item_id, i.item_title, i.listing_status,
+                           i.last_seen_at, s.enabled, s.min_stock, s.last_attempt_at,
+                           s.last_result, s.last_reason, s.attempts_today, s.attempt_date
+                    FROM item_info i
+                    JOIN item_relist_settings s
+                      ON s.user_id = ?
+                     AND s.cookie_id = i.cookie_id
+                     AND s.item_id = i.item_id
+                    WHERE i.listing_status IN ('off_shelf', 'on_sale_pending')
+                      AND s.enabled = 1
+                '''
+                params: List[Any] = [user_id]
+                if cookie_id:
+                    sql += " AND i.cookie_id = ?"
+                    params.append(cookie_id)
+                sql += '''
+                    ORDER BY CASE WHEN s.last_attempt_at IS NULL THEN 0 ELSE 1 END,
+                             s.last_attempt_at ASC
+                '''
+                cursor.execute(sql, params)
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"列出自动上架候选商品失败: {e}")
+            return []
+
+    def record_item_relist_attempt(self, user_id: int, cookie_id: str, item_id: str,
+                                   result: str, reason: str = '') -> bool:
+        """记录一次自动上架尝试（成功/失败/跳过）。"""
+        try:
+            today = datetime.now().date().isoformat()
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE item_relist_settings SET
+                        last_attempt_at = CURRENT_TIMESTAMP,
+                        last_result = ?,
+                        last_reason = ?,
+                        attempts_today = CASE
+                            WHEN attempt_date = ? THEN attempts_today + 1
+                            ELSE 1
+                        END,
+                        attempt_date = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND cookie_id = ? AND item_id = ?
+                ''', (result, reason, today, today, user_id, cookie_id, item_id))
+                self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"记录自动上架尝试失败: {e}")
+            return False
+
+    def get_item_relist_logs(self, user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+        """最近有上架尝试记录的商品。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT s.cookie_id, s.item_id, i.item_title, s.enabled,
+                           s.last_attempt_at, s.last_result, s.last_reason,
+                           s.attempts_today, s.attempt_date
+                    FROM item_relist_settings s
+                    LEFT JOIN item_info i
+                      ON i.cookie_id = s.cookie_id AND i.item_id = s.item_id
+                    WHERE s.user_id = ? AND s.last_attempt_at IS NOT NULL
+                    ORDER BY s.last_attempt_at DESC
+                    LIMIT ?
+                ''', (user_id, max(1, int(limit))))
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"读取自动上架日志失败: {e}")
+            return []
+
+    def set_item_listing_pending(self, cookie_id: str, item_id: str) -> bool:
+        """上架动作成功后先标记为 pending，等下一次同步确认，避免重复点击。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE item_info
+                    SET listing_status = 'on_sale_pending', updated_at = CURRENT_TIMESTAMP
+                    WHERE cookie_id = ? AND item_id = ?
+                ''', (cookie_id, item_id))
+                self.conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"标记商品待确认上架失败: {e}")
+            return False
 
     # ==================== 风控日志管理 ====================
 

@@ -491,6 +491,56 @@ export interface ReplyRule {
   reply_content: string;
   match_type: 'exact' | 'fuzzy';
   enabled: boolean;
+  /** 为空表示通用关键词；非空表示只对该商品生效 */
+  item_id?: string;
+}
+
+/** 单个商品的专属自动回复 */
+export interface ItemReply {
+  item_id: string;
+  cookie_id: string;
+  reply_content: string;
+  /** 1=命中该商品时优先回复；0=仅作为关键词/AI 未命中后的兜底 */
+  priority: number;
+  item_title?: string;
+  item_detail?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** 商品级自动重新上架配置 */
+export interface ItemRelistSetting {
+  cookie_id: string;
+  item_id: string;
+  enabled: number | boolean;
+  min_stock: number;
+  last_attempt_at?: string;
+  last_result?: string;
+  last_reason?: string;
+  attempts_today?: number;
+  attempt_date?: string;
+  item_title?: string;
+  listing_status?: string;
+  last_seen_at?: string;
+}
+
+export interface ItemRelistStockDetail {
+  variant: string;
+  stock: number;
+  required: number;
+}
+
+export interface ItemRelistStock {
+  eligible: boolean;
+  reason: string;
+  source: 'variant' | 'rule';
+  details?: ItemRelistStockDetail[];
+}
+
+export interface ItemRelistCandidate extends ItemRelistSetting {
+  eligible: boolean;
+  reason: string;
+  stock: ItemRelistStock | null;
 }
 
 // Stats
@@ -560,6 +610,12 @@ export interface SystemSettings {
   // 商品擦亮，默认关闭
   auto_polish_enabled?: boolean;
   auto_polish_interval?: number;
+  // 自动重新上架：默认关闭，默认 dry-run
+  auto_relist_enabled?: boolean | string;
+  auto_relist_dry_run?: boolean | string;
+  auto_relist_interval?: number | string;
+  auto_relist_max_per_run?: number | string;
+  auto_relist_cooldown_minutes?: number | string;
   // 对买家产生实际动作，默认关闭
   auto_rate_enabled?: boolean;
   // 订单页评价框的预填文案，避免每单重复手打

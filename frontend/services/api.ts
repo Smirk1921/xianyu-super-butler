@@ -4,6 +4,9 @@ import {
   AdminStats, AdminUser, Card, CardShipment, SystemSettings, ApiResponse, OrderAnalytics,
   Item, ItemDeliveryConfig, ItemDeliveryConfigSummary,
   ProductVariantBinding, AIReplySettings, ShippingRule, ReplyRule, DefaultReply,
+  ItemReply,
+  ItemRelistSetting,
+  ItemRelistCandidate,
   DeliveryBlockRule, PersonalBlacklistEntry, MessageNotification,
   NotificationChannel, NotificationChannelType, RiskControlLog, SystemLog,
   NotificationEventDefinition, NotificationPriorityDefinition,
@@ -856,6 +859,90 @@ export const deletePersonalBlacklist = async (entryId: number): Promise<void> =>
   await del(`/blacklist/${entryId}`);
 };
 
+// 商品专属回复
+export const getItemReplies = async (cookieId: string): Promise<ItemReply[]> => {
+    const res = await get<{ items: ItemReply[] }>(`/itemReplays/cookie/${cookieId}`);
+    return res.items || [];
+};
+
+export const getItemReply = async (
+    cookieId: string,
+    itemId: string,
+): Promise<ItemReply | null> => {
+    try {
+        return await get<ItemReply>(`/item-reply/${cookieId}/${itemId}`);
+    } catch {
+        // 未配置时后端返回 404，调用方按空配置处理
+        return null;
+    }
+};
+
+export const updateItemReply = async (
+    cookieId: string,
+    itemId: string,
+    replyContent: string,
+    priority = 1,
+): Promise<ApiResponse> => {
+    return put(`/item-reply/${cookieId}/${itemId}`, {
+        reply_content: replyContent,
+        priority,
+    });
+};
+
+export const deleteItemReply = async (
+    cookieId: string,
+    itemId: string,
+): Promise<ApiResponse> => {
+    return del(`/item-reply/${cookieId}/${itemId}`);
+};
+
+// 自动重新上架
+export const getItemRelistSettings = async (
+    cookieId?: string,
+): Promise<ItemRelistSetting[]> => {
+    const query = cookieId ? `?cookie_id=${encodeURIComponent(cookieId)}` : '';
+    const res = await get<{ items: ItemRelistSetting[] }>(`/item-relist/settings${query}`);
+    return res.items || [];
+};
+
+export const updateItemRelistSetting = async (
+    cookieId: string,
+    itemId: string,
+    enabled: boolean,
+    minStock = 1,
+): Promise<ApiResponse> => {
+    return put(`/item-relist/settings/${cookieId}/${itemId}`, {
+        enabled,
+        min_stock: minStock,
+    });
+};
+
+export const getItemRelistCandidates = async (
+    cookieId?: string,
+): Promise<ItemRelistCandidate[]> => {
+    const query = cookieId ? `?cookie_id=${encodeURIComponent(cookieId)}` : '';
+    const res = await get<{ items: ItemRelistCandidate[] }>(`/item-relist/candidates${query}`);
+    return res.items || [];
+};
+
+export const runItemRelist = async (
+    cookieId: string,
+    itemId: string,
+): Promise<{
+    success: boolean;
+    dry_run?: boolean;
+    reason?: string;
+    message?: string;
+    stock?: unknown;
+}> => {
+    return post(`/item-relist/run/${cookieId}/${itemId}`, {});
+};
+
+export const getItemRelistLogs = async (limit = 100): Promise<ItemRelistSetting[]> => {
+    const res = await get<{ items: ItemRelistSetting[] }>(`/item-relist/logs?limit=${limit}`);
+    return res.items || [];
+};
+
 // Rules - 关键词回复规则 (使用关键词API)
 export const getReplyRules = async (cookieId?: string): Promise<ReplyRule[]> => {
     if (!cookieId) return [];
@@ -865,6 +952,7 @@ export const getReplyRules = async (cookieId?: string): Promise<ReplyRule[]> => 
         id: String(index),
         keyword: item.keyword || '',
         reply_content: item.reply || '',
+        item_id: item.item_id || '',
         match_type: 'exact' as const,
         enabled: true
     }));
@@ -875,21 +963,22 @@ export const updateReplyRule = async (rule: Partial<ReplyRule>, cookieId: string
     const existing = await get<any>(`/keywords-with-item-id/${cookieId}`);
     const keywords = Array.isArray(existing) ? existing : [];
 
-    // 更新或添加关键词
+    // 更新或添加关键词。必须保留原对象的 item_id / type / image_url：
+    // 后端按关键词 + item_id 做唯一键，置空会把商品专属规则静默变成通用规则。
     if (rule.id) {
         const index = parseInt(rule.id);
         if (index >= 0 && index < keywords.length) {
             keywords[index] = {
+                ...keywords[index],
                 keyword: rule.keyword,
                 reply: rule.reply_content,
-                item_id: ''
             };
         }
     } else {
         keywords.push({
             keyword: rule.keyword,
             reply: rule.reply_content,
-            item_id: ''
+            item_id: rule.item_id || ''
         });
     }
 

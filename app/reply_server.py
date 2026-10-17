@@ -22,6 +22,7 @@ from app import cookie_manager
 from app.db_manager import db_manager
 from app.delivery_template import send_payload as send_delivery_payload
 from app.product_automation import ProductAutomationService
+from app.item_relist import ItemRelistService
 from app.file_log_collector import setup_file_logging, get_file_log_collector
 from app.ai_reply_engine import ai_reply_engine
 from app.services.notification_channels import (
@@ -50,6 +51,7 @@ from utils.order_status_rules import (
 from loguru import logger
 
 product_automation = ProductAutomationService(db_manager)
+item_relist_service = ItemRelistService(db_manager)
 notification_sender = NotificationSender()
 notification_test_service = NotificationTestService(
     db_manager,
@@ -7405,15 +7407,21 @@ def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(g
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
 
+class ItemReplyIn(BaseModel):
+    reply_content: str
+    # 1=命中该商品时优先回复；0=仅作为关键词/AI 未命中后的兜底
+    priority: int = 1
+
+
 @app.put("/item-reply/{cookie_id}/{item_id}")
 def update_item_reply(
     cookie_id: str,
     item_id: str,
-    data: dict,
+    data: ItemReplyIn,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
-    更新指定账号和商品的回复内容
+    更新指定账号和商品的专属回复内容
     """
     try:
         user_id = current_user['user_id']
@@ -7424,13 +7432,24 @@ def update_item_reply(
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
-        reply_content = data.get("reply_content", "").strip()
+        reply_content = (data.reply_content or "").strip()
         if not reply_content:
             raise HTTPException(status_code=400, detail="回复内容不能为空")
 
-        db_manager.update_item_reply(cookie_id=cookie_id, item_id=item_id, reply_content=reply_content)
+        # 防止给不存在的商品写孤儿配置
+        if not db_manager.get_item_info(cookie_id, item_id):
+            raise HTTPException(status_code=404, detail="商品不存在或不属于该账号")
 
-        return {"message": "商品回复更新成功"}
+        priority = 1 if data.priority else 0
+        if not db_manager.update_item_reply(
+            cookie_id=cookie_id,
+            item_id=item_id,
+            reply_content=reply_content,
+            priority=priority,
+        ):
+            raise HTTPException(status_code=500, detail="保存商品回复失败")
+
+        return {"message": "商品回复更新成功", "priority": priority}
 
     except HTTPException:
         raise
@@ -7501,20 +7520,169 @@ def get_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = 
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
-        # 获取指定商品回复
-        item_replies = db_manager.get_itemReplays_by_cookie(cookie_id)
-        # 找对应item_id的回复
-        item_reply = next((r for r in item_replies if r['item_id'] == item_id), None)
+        # 直接按 cookie + item 查询，避免整表扫描和 JOIN 重复行
+        item_reply = db_manager.get_item_reply(cookie_id, item_id)
 
         if item_reply is None:
             raise HTTPException(status_code=404, detail="商品回复不存在")
 
-        return item_reply
+        item_info = db_manager.get_item_info(cookie_id, item_id) or {}
+        return {
+            "item_id": item_id,
+            "cookie_id": cookie_id,
+            "reply_content": item_reply.get("reply_content", ""),
+            "priority": item_reply.get("priority", 1),
+            "created_at": item_reply.get("created_at"),
+            "updated_at": item_reply.get("updated_at"),
+            "item_title": item_info.get("item_title", ""),
+            "item_detail": item_info.get("item_detail", ""),
+        }
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取商品回复失败: {str(e)}")
+
+
+# ------------------------- 商品自动重新上架 -------------------------
+
+class ItemRelistSettingIn(BaseModel):
+    enabled: bool
+    min_stock: int = 1
+
+
+@app.get("/item-relist/candidates")
+def list_item_relist_candidates(
+    cookie_id: str = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """列出已开启自动上架、当前下架且库存可判断的商品。"""
+    try:
+        from app.db_manager import db_manager
+
+        user_id = current_user["user_id"]
+        if cookie_id and cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
+
+        cooldown = int(db_manager.get_system_setting("auto_relist_cooldown_minutes") or 60)
+        items = item_relist_service.list_candidates(
+            user_id, cookie_id, cooldown_minutes=cooldown
+        )
+        return {"items": items}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取自动上架候选失败: {str(e)}")
+
+
+@app.get("/item-relist/settings")
+def list_item_relist_settings_endpoint(
+    cookie_id: str = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        from app.db_manager import db_manager
+
+        user_id = current_user["user_id"]
+        if cookie_id and cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
+        return {"items": db_manager.list_item_relist_settings(user_id, cookie_id)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取自动上架配置失败: {str(e)}")
+
+
+@app.put("/item-relist/settings/{cookie_id}/{item_id}")
+def update_item_relist_setting(
+    cookie_id: str,
+    item_id: str,
+    data: ItemRelistSettingIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        from app.db_manager import db_manager
+
+        user_id = current_user["user_id"]
+        if cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
+        if not db_manager.get_item_info(cookie_id, item_id):
+            raise HTTPException(status_code=404, detail="商品不存在或不属于该账号")
+
+        ok = db_manager.upsert_item_relist_setting(
+            user_id, cookie_id, item_id, data.enabled, data.min_stock
+        )
+        if not ok:
+            raise HTTPException(status_code=500, detail="保存自动上架配置失败")
+        return {
+            "success": True,
+            "enabled": bool(data.enabled),
+            "min_stock": max(1, int(data.min_stock or 1)),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"保存自动上架配置失败: {str(e)}")
+
+
+@app.post("/item-relist/run/{cookie_id}/{item_id}")
+def run_item_relist(
+    cookie_id: str,
+    item_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动触发一次上架检查。当前版本只做资格检查（dry-run）。"""
+    try:
+        from app.db_manager import db_manager
+
+        user_id = current_user["user_id"]
+        if cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
+
+        item = db_manager.get_item_info(cookie_id, item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="商品不存在或不属于该账号")
+
+        setting = db_manager.get_item_relist_setting(user_id, cookie_id, item_id) or {}
+        cooldown = int(db_manager.get_system_setting("auto_relist_cooldown_minutes") or 60)
+        candidate = {
+            "cookie_id": cookie_id,
+            "item_id": item_id,
+            "listing_status": item.get("listing_status"),
+            "last_seen_at": item.get("last_seen_at"),
+            "last_attempt_at": setting.get("last_attempt_at"),
+            "min_stock": setting.get("min_stock") or 1,
+        }
+        evaluation = item_relist_service.check_eligibility(
+            candidate, user_id, cooldown_minutes=cooldown
+        )
+        return {
+            "success": evaluation["eligible"],
+            "dry_run": True,
+            "reason": evaluation["reason"],
+            "stock": evaluation["stock"],
+            "message": (
+                "资格检查通过；执行器尚未启用，本次没有对闲鱼发起上架"
+                if evaluation["eligible"]
+                else "当前不满足自动上架条件"
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"自动上架检查失败: {str(e)}")
+
+
+@app.get("/item-relist/logs")
+def get_item_relist_logs(
+    limit: int = 100,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        from app.db_manager import db_manager
+        return {"items": db_manager.get_item_relist_logs(current_user["user_id"], limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取自动上架日志失败: {str(e)}")
 
 
 # ------------------------- 数据库备份和恢复接口 -------------------------
@@ -9097,6 +9265,7 @@ API_ROOTS = {
     'cards', 'change-admin-password', 'change-password', 'cookie', 'cookies',
     'blacklist', 'debug', 'default-replies', 'delivery-block-rules', 'delivery-rules', 'face-verification',
     'generate-captcha', 'geetest', 'health', 'item-reply', 'itemReplays', 'items',
+    'item-relist',
     'item-delivery-configs',
     'keywords', 'keywords-export', 'keywords-import', 'keywords-with-item-id',
     'keywords-with-type', 'login', 'login-info-settings', 'login-info-status',
