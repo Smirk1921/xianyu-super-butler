@@ -64,16 +64,43 @@ class ItemReplyTests(unittest.TestCase):
 
     def test_update_is_upsert_with_single_row(self):
         self.manager.update_item_reply("acc-a", "1001", "第一版")
-        self.manager.update_item_reply("acc-a", "1001", "第二版", priority=0)
+        self.manager.update_item_reply(
+            "acc-a", "1001", "第二版", priority=0, reply_once=0
+        )
 
         rows = self.manager.conn.execute(
-            "SELECT reply_content, priority FROM item_replay "
+            "SELECT reply_content, priority, reply_once FROM item_replay "
             "WHERE cookie_id=? AND item_id=?",
             ("acc-a", "1001"),
         ).fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0], "第二版")
         self.assertEqual(rows[0][1], 0)
+        self.assertEqual(rows[0][2], 0)
+
+        reply = self.manager.get_item_reply("acc-a", "1001")
+        self.assertEqual(reply["reply_once"], 0)
+
+    def test_item_reply_records_are_scoped_by_chat_and_item(self):
+        self.assertFalse(
+            self.manager.has_item_reply_record("acc-a", "chat-1", "1001")
+        )
+        self.manager.add_item_reply_record("acc-a", "chat-1", "1001")
+        self.assertTrue(
+            self.manager.has_item_reply_record("acc-a", "chat-1", "1001")
+        )
+        # 同一会话的另一个商品不受影响
+        self.assertFalse(
+            self.manager.has_item_reply_record("acc-a", "chat-1", "1002")
+        )
+        # 同一商品在另一个会话也不受影响
+        self.assertFalse(
+            self.manager.has_item_reply_record("acc-a", "chat-2", "1001")
+        )
+        # 另一个账号同样隔离
+        self.assertFalse(
+            self.manager.has_item_reply_record("acc-b", "chat-1", "1001")
+        )
 
     def test_unique_index_rejects_duplicate_insert(self):
         self.manager.update_item_reply("acc-a", "1001", "first")

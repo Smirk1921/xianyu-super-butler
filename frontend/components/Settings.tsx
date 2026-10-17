@@ -572,8 +572,9 @@ const Settings: React.FC = () => {
               </label>
             </div>
             <p className="px-4 pb-3 text-xs text-gray-500">
-              只有「批量」类型卡密有真实库存；固定文本、图片和 API 发卡无法判断余量，
-              不会参与自动上架。执行器需要先用探测脚本生成 relist_config.json。
+              「批量」卡密按剩余行数判断，发完才不再自动上架；固定文本、图片和 API 发卡
+              没有本地库存概念，只要有内容就视为可继续上架。执行器需要先用探测脚本生成
+              relist_config.json。
             </p>
           </section>
 

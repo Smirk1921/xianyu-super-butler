@@ -223,6 +223,7 @@ const ItemList: React.FC = () => {
   const [replyItem, setReplyItem] = useState<Item | null>(null);
   const [replyContent, setReplyContent] = useState('');
   const [replyPriority, setReplyPriority] = useState(1);
+  const [replyOnce, setReplyOnce] = useState(1);
   const [replyLoading, setReplyLoading] = useState(false);
   const [replySaving, setReplySaving] = useState(false);
 
@@ -493,12 +494,14 @@ const ItemList: React.FC = () => {
     setReplyItem(item);
     setReplyContent('');
     setReplyPriority(1);
+    setReplyOnce(1);
     setReplyLoading(true);
     try {
       const data = await getItemReply(item.cookie_id, item.item_id);
       if (data) {
         setReplyContent(data.reply_content || '');
         setReplyPriority(data.priority === 0 ? 0 : 1);
+        setReplyOnce(data.reply_once === 0 ? 0 : 1);
       }
     } catch (error) {
       setNotice({ type: 'error', message: error instanceof Error ? error.message : '读取专属回复失败' });
@@ -516,7 +519,13 @@ const ItemList: React.FC = () => {
     }
     setReplySaving(true);
     try {
-      await updateItemReply(replyItem.cookie_id, replyItem.item_id, content, replyPriority);
+      await updateItemReply(
+        replyItem.cookie_id,
+        replyItem.item_id,
+        content,
+        replyPriority,
+        replyOnce,
+      );
       const key = itemKey(replyItem);
       setItemReplies(current => ({
         ...current,
@@ -525,6 +534,7 @@ const ItemList: React.FC = () => {
           item_id: replyItem.item_id,
           reply_content: content,
           priority: replyPriority,
+          reply_once: replyOnce,
         },
       }));
       setReplyItem(null);
@@ -1116,7 +1126,7 @@ const ItemList: React.FC = () => {
                         <div className="flex items-center justify-between gap-3">
                           <span
                             className="text-xs font-semibold text-gray-600"
-                            title="售完下架后，如果绑定的批量卡密还有库存，自动重新上架"
+                            title="售完下架后，如果绑定的卡密仍可用（批量卡密按剩余条数判断），自动重新上架"
                           >
                             自动上架
                           </span>
@@ -1591,6 +1601,20 @@ const ItemList: React.FC = () => {
                       type="checkbox"
                       checked={replyPriority === 1}
                       onChange={event => setReplyPriority(event.target.checked ? 1 : 0)}
+                      className="h-4 w-4"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between gap-4 rounded-md border border-gray-200 px-3 py-2.5">
+                    <span>
+                      <span className="block text-sm font-bold text-gray-800">同一会话只回复一次</span>
+                      <span className="mt-0.5 block text-xs text-gray-500">
+                        买家第一次询问这个商品时触发；之后的消息继续走关键词、AI 或账号默认回复。
+                      </span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={replyOnce === 1}
+                      onChange={event => setReplyOnce(event.target.checked ? 1 : 0)}
                       className="h-4 w-4"
                     />
                   </label>

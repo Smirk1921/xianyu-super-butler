@@ -5,9 +5,9 @@
 - 真正的上架动作由 ``utils/item_relist.py`` 执行，调度在 ``XianyuAutoAsync``。
 
 库存口径：
-- 只有 ``data``（批量卡密）有真实本地库存，按剩余行数计算。
-- ``text`` / ``image`` / ``api`` 无法判断余量，一律判定为不可自动上架，
-  避免把手动下架或违规下架的商品无差别重新挂上去。
+- ``data``（批量卡密）按剩余行数判断，发完才算没有库存；
+- ``text`` / ``image`` / ``api`` 没有本地库存概念，只要有内容就视为可继续上架。
+  这是按“固定文本也能无限发”的实际用法定的，避免卖完一批后商品永久下架。
 """
 
 from datetime import datetime, timedelta
@@ -54,23 +54,42 @@ class ItemRelistService:
                     return {'eligible': False, 'reason': f'规格“{name}”绑定的卡密已停用', 'source': 'variant'}
 
                 card_type = variant.get('card_type')
-                if card_type != 'data':
-                    label = CARD_TYPE_LABELS.get(card_type, card_type or '未知')
-                    return {
-                        'eligible': False,
-                        'reason': f'规格“{name}”绑定的是{label}，无法判断库存',
-                        'source': 'variant',
-                    }
-
                 required = max(1, int(variant.get('delivery_count') or 1)) * min_stock
-                stock = variant.get('stock_count')
-                if stock is None or stock < required:
+
+                if card_type == 'data':
+                    stock = variant.get('stock_count')
+                    if stock is None or stock < required:
+                        return {
+                            'eligible': False,
+                            'reason': f'规格“{name}”库存不足（{stock or 0}/{required}）',
+                            'source': 'variant',
+                        }
+                    details.append({'variant': name, 'stock': stock, 'required': required})
+                elif card_type == 'text':
+                    if not (variant.get('text_content') or '').strip():
+                        return {
+                            'eligible': False,
+                            'reason': f'规格“{name}”绑定的固定文本为空',
+                            'source': 'variant',
+                        }
+                    details.append({'variant': name, 'stock': None, 'required': 0})
+                elif card_type == 'image':
+                    if not (variant.get('image_url') or '').strip():
+                        return {
+                            'eligible': False,
+                            'reason': f'规格“{name}”绑定的图片地址为空',
+                            'source': 'variant',
+                        }
+                    details.append({'variant': name, 'stock': None, 'required': 0})
+                elif card_type == 'api':
+                    # API 发卡的余量由外部服务决定，本地无法判断，按可用处理
+                    details.append({'variant': name, 'stock': None, 'required': 0})
+                else:
                     return {
                         'eligible': False,
-                        'reason': f'规格“{name}”库存不足（{stock or 0}/{required}）',
+                        'reason': f'规格“{name}”的卡密类型未知（{card_type}）',
                         'source': 'variant',
                     }
-                details.append({'variant': name, 'stock': stock, 'required': required})
 
             return {'eligible': True, 'reason': '', 'source': 'variant', 'details': details}
 
@@ -87,20 +106,39 @@ class ItemRelistService:
 
         rule = rules[0]
         card_type = rule.get('card_type')
-        if card_type != 'data':
-            label = CARD_TYPE_LABELS.get(card_type, card_type or '未知')
-            return {
-                'eligible': False,
-                'reason': f'绑定的是{label}，无法判断库存',
-                'source': 'rule',
-            }
-
         required = max(1, int(rule.get('delivery_count') or 1)) * min_stock
-        stock = self.db._card_stock_count(card_type, rule.get('data_content'))
-        if stock is None or stock < required:
+
+        if card_type == 'data':
+            stock = self.db._card_stock_count(card_type, rule.get('data_content'))
+            if stock is None or stock < required:
+                return {
+                    'eligible': False,
+                    'reason': f'库存不足（{stock or 0}/{required}）',
+                    'source': 'rule',
+                }
+            details = [{'variant': '默认', 'stock': stock, 'required': required}]
+        elif card_type == 'text':
+            if not (rule.get('text_content') or '').strip():
+                return {
+                    'eligible': False,
+                    'reason': '绑定的固定文本为空',
+                    'source': 'rule',
+                }
+            details = [{'variant': '默认', 'stock': None, 'required': 0}]
+        elif card_type == 'image':
+            if not (rule.get('image_url') or '').strip():
+                return {
+                    'eligible': False,
+                    'reason': '绑定的图片地址为空',
+                    'source': 'rule',
+                }
+            details = [{'variant': '默认', 'stock': None, 'required': 0}]
+        elif card_type == 'api':
+            details = [{'variant': '默认', 'stock': None, 'required': 0}]
+        else:
             return {
                 'eligible': False,
-                'reason': f'库存不足（{stock or 0}/{required}）',
+                'reason': f'卡密类型未知（{card_type}）',
                 'source': 'rule',
             }
 
@@ -108,7 +146,7 @@ class ItemRelistService:
             'eligible': True,
             'reason': '',
             'source': 'rule',
-            'details': [{'variant': '默认', 'stock': stock, 'required': required}],
+            'details': details,
         }
 
     # ------------------------------------------------------------------

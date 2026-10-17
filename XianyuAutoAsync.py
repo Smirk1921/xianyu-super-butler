@@ -4413,23 +4413,48 @@ class XianyuLive:
                     and item_reply.get('reply_content')
                     and int(item_reply.get('priority') or 1) == 0
                 ):
-                    reply_content = item_reply['reply_content']
-                    logger.info(f"【{self.cookie_id}】使用指定商品回复: 商品ID={item_id}")
-
-                    # 进行变量替换
-                    try:
-                        formatted_reply = reply_content.format(
-                            send_user_name=send_user_name,
-                            send_user_id=send_user_id,
-                            send_message=send_message,
-                            item_id=item_id
+                    reply_once = (
+                        1 if item_reply.get('reply_once') is None
+                        else int(item_reply.get('reply_once') or 0)
+                    )
+                    already_replied = bool(
+                        reply_once
+                        and chat_id
+                        and db_manager.has_item_reply_record(
+                            self.cookie_id, chat_id, item_id
                         )
-                        logger.info(f"【{self.cookie_id}】指定商品回复内容: {formatted_reply}")
-                        return {'text': formatted_reply, 'image_url': None}
-                    except Exception as format_error:
-                        logger.error(f"指定商品回复变量替换失败: {self._safe_str(format_error)}")
-                        # 如果变量替换失败，返回原始内容
-                        return {'text': reply_content, 'image_url': None}
+                    )
+                    if already_replied:
+                        logger.info(
+                            f"【{self.cookie_id}】商品 {item_id} 的兜底专属回复本会话已触发过，"
+                            f"改用账号默认回复"
+                        )
+                    else:
+                        reply_content = item_reply['reply_content']
+                        logger.info(f"【{self.cookie_id}】使用指定商品回复: 商品ID={item_id}")
+
+                        # 进行变量替换
+                        try:
+                            formatted_reply = reply_content.format(
+                                send_user_name=send_user_name,
+                                send_user_id=send_user_id,
+                                send_message=send_message,
+                                item_id=item_id
+                            )
+                            if reply_once and chat_id:
+                                db_manager.add_item_reply_record(
+                                    self.cookie_id, chat_id, item_id
+                                )
+                            logger.info(f"【{self.cookie_id}】指定商品回复内容: {formatted_reply}")
+                            return {'text': formatted_reply, 'image_url': None}
+                        except Exception as format_error:
+                            logger.error(f"指定商品回复变量替换失败: {self._safe_str(format_error)}")
+                            # 如果变量替换失败，返回原始内容
+                            if reply_once and chat_id:
+                                db_manager.add_item_reply_record(
+                                    self.cookie_id, chat_id, item_id
+                                )
+                            return {'text': reply_content, 'image_url': None}
                 else:
                     logger.warning(f"【{self.cookie_id}】商品ID {item_id} 没有配置指定回复，使用默认回复")
 
@@ -9734,22 +9759,43 @@ class XianyuLive:
                     and raw_item_reply.strip()
                     and int(item_reply.get('priority') or 1) == 1
                 ):
-                    try:
-                        reply = raw_item_reply.format(
-                            send_user_name=send_user_name,
-                            send_user_id=send_user_id,
-                            send_message=send_message,
-                            item_id=item_id,
+                    reply_once = (
+                        1 if item_reply.get('reply_once') is None
+                        else int(item_reply.get('reply_once') or 0)
+                    )
+                    already_replied = bool(
+                        reply_once
+                        and chat_id
+                        and db_manager.has_item_reply_record(
+                            self.cookie_id, chat_id, item_id
                         )
-                    except Exception as format_error:
-                        logger.warning(
-                            f"【{self.cookie_id}】商品专属回复变量替换失败，使用原文: "
-                            f"{self._safe_str(format_error)}"
+                    )
+                    if already_replied:
+                        logger.info(
+                            f"【{self.cookie_id}】商品 {item_id} 的专属回复本会话已触发过，"
+                            f"继续走关键词/AI/默认回复"
                         )
-                        reply = raw_item_reply
-                    reply_strategy = "item"
-                    reply_source = "专属"
-                    logger.info(f"【{self.cookie_id}】使用商品专属回复: 商品ID={item_id}")
+                    else:
+                        try:
+                            reply = raw_item_reply.format(
+                                send_user_name=send_user_name,
+                                send_user_id=send_user_id,
+                                send_message=send_message,
+                                item_id=item_id,
+                            )
+                        except Exception as format_error:
+                            logger.warning(
+                                f"【{self.cookie_id}】商品专属回复变量替换失败，使用原文: "
+                                f"{self._safe_str(format_error)}"
+                            )
+                            reply = raw_item_reply
+                        reply_strategy = "item"
+                        reply_source = "专属"
+                        if reply_once and chat_id:
+                            db_manager.add_item_reply_record(
+                                self.cookie_id, chat_id, item_id
+                            )
+                        logger.info(f"【{self.cookie_id}】使用商品专属回复: 商品ID={item_id}")
             except Exception as item_reply_error:
                 logger.warning(
                     f"【{self.cookie_id}】读取商品专属回复失败: "

@@ -48,6 +48,24 @@ class ItemRelistTests(unittest.TestCase):
             "VALUES (3, '停用卡', 'data', ?, 0, ?)",
             ("x1\nx2", self.user_id),
         )
+        # 图片卡密
+        cursor.execute(
+            "INSERT INTO cards (id, name, type, image_url, enabled, user_id) "
+            "VALUES (4, '图片卡', 'image', 'https://example.test/a.png', 1, ?)",
+            (self.user_id,),
+        )
+        # API 卡密
+        cursor.execute(
+            "INSERT INTO cards (id, name, type, api_config, enabled, user_id) "
+            "VALUES (5, 'API卡', 'api', ?, 1, ?)",
+            ('{"url": "https://example.test/api"}', self.user_id),
+        )
+        # 内容为空的固定文本卡密
+        cursor.execute(
+            "INSERT INTO cards (id, name, type, text_content, enabled, user_id) "
+            "VALUES (6, '空文本卡', 'text', '', 1, ?)",
+            (self.user_id,),
+        )
         self.manager.conn.commit()
         self.service = ItemRelistService(self.manager)
 
@@ -111,12 +129,31 @@ class ItemRelistTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertIn("库存不足", result["reason"])
 
-    def test_text_card_cannot_be_evaluated(self):
+    def test_text_card_is_eligible(self):
         self._add_item("1001")
         self._bind_variant("1001", 2)
         result = self.service.evaluate_stock("acc", "1001", self.user_id, 1)
+        self.assertTrue(result["eligible"])
+        self.assertIsNone(result["details"][0]["stock"])
+
+    def test_empty_text_card_is_rejected(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 6)
+        result = self.service.evaluate_stock("acc", "1001", self.user_id, 1)
         self.assertFalse(result["eligible"])
-        self.assertIn("无法判断库存", result["reason"])
+        self.assertIn("固定文本为空", result["reason"])
+
+    def test_image_card_is_eligible(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 4)
+        result = self.service.evaluate_stock("acc", "1001", self.user_id, 1)
+        self.assertTrue(result["eligible"])
+
+    def test_api_card_is_eligible(self):
+        self._add_item("1001")
+        self._bind_variant("1001", 5)
+        result = self.service.evaluate_stock("acc", "1001", self.user_id, 1)
+        self.assertTrue(result["eligible"])
 
     def test_disabled_card_is_rejected(self):
         self._add_item("1001")

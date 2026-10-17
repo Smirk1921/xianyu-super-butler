@@ -800,6 +800,7 @@ class DBManager:
 
             # 创建指定商品回复表
             # priority=1 表示命中该商品时优先回复；0 表示仅作为关键词/AI 都未命中后的兜底
+            # reply_once=1 表示同一会话只触发一次，后续消息继续走关键词/AI/默认回复
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS item_replay (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -807,9 +808,22 @@ class DBManager:
                     cookie_id TEXT NOT NULL,
                     reply_content TEXT NOT NULL ,
                     priority INTEGER DEFAULT 1,
+                    reply_once INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(cookie_id, item_id)
+                )
+            ''')
+
+            # 商品专属回复的“已触发”记录，按 会话 + 商品 去重
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS item_reply_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cookie_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(cookie_id, chat_id, item_id)
                 )
             ''')
 
@@ -1128,6 +1142,9 @@ class DBManager:
             if 'priority' not in item_replay_columns:
                 logger.info("添加item_replay表的priority列...")
                 cursor.execute("ALTER TABLE item_replay ADD COLUMN priority INTEGER DEFAULT 1")
+            if 'reply_once' not in item_replay_columns:
+                logger.info("添加item_replay表的reply_once列...")
+                cursor.execute("ALTER TABLE item_replay ADD COLUMN reply_once INTEGER DEFAULT 1")
             cursor.execute('''
                 DELETE FROM item_replay
                 WHERE id NOT IN (
@@ -6052,7 +6069,8 @@ class DBManager:
                        pv.enabled, pv.created_at, pv.updated_at,
                        vdb.id, vdb.card_id, vdb.delivery_count,
                        vdb.delivery_times, vdb.enabled,
-                       c.name, c.type, c.enabled, c.data_content
+                       c.name, c.type, c.enabled, c.data_content,
+                       c.text_content, c.image_url, c.api_config
                 FROM product_variants pv
                 LEFT JOIN variant_delivery_bindings vdb
                   ON vdb.variant_id = pv.id
@@ -6090,6 +6108,9 @@ class DBManager:
                     "card_type": row[15],
                     "card_enabled": bool(row[16]) if row[16] is not None else False,
                     "stock_count": self._card_stock_count(row[15], row[17]),
+                    "text_content": row[18],
+                    "image_url": row[19],
+                    "api_config": row[20],
                 })
 
             configured_count = sum(
@@ -7699,12 +7720,12 @@ class DBManager:
                 cursor = self.conn.cursor()
                 if cookie_id:
                     cursor.execute('''
-                        SELECT reply_content, priority FROM item_replay
+                        SELECT reply_content, priority, reply_once FROM item_replay
                         WHERE cookie_id = ? AND item_id = ?
                     ''', (cookie_id, item_id))
                 else:
                     cursor.execute('''
-                        SELECT reply_content, priority FROM item_replay
+                        SELECT reply_content, priority, reply_once FROM item_replay
                         WHERE item_id = ?
                     ''', (item_id,))
 
@@ -7713,6 +7734,7 @@ class DBManager:
                     return {
                         'reply_content': row[0] or '',
                         'priority': row[1] if row[1] is not None else 1,
+                        'reply_once': row[2] if row[2] is not None else 1,
                     }
                 return None
         except Exception as e:
@@ -7734,7 +7756,7 @@ class DBManager:
             with self.lock:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                    SELECT reply_content, priority, created_at, updated_at
+                    SELECT reply_content, priority, reply_once, created_at, updated_at
                     FROM item_replay
                     WHERE cookie_id = ? AND item_id = ?
                 ''', (cookie_id, item_id))
@@ -7744,8 +7766,9 @@ class DBManager:
                     return {
                         'reply_content': row[0] or '',
                         'priority': row[1] if row[1] is not None else 1,
-                        'created_at': row[2],
-                        'updated_at': row[3]
+                        'reply_once': row[2] if row[2] is not None else 1,
+                        'created_at': row[3],
+                        'updated_at': row[4]
                     }
                 return None
         except Exception as e:
@@ -7753,7 +7776,7 @@ class DBManager:
             return None
 
     def update_item_reply(self, cookie_id: str, item_id: str, reply_content: str,
-                          priority: int = 1) -> bool:
+                          priority: int = 1, reply_once: int = 1) -> bool:
         """
         更新指定cookie和item的回复内容及更新时间（原子 upsert）
 
@@ -7762,6 +7785,7 @@ class DBManager:
             item_id (str): 商品ID
             reply_content (str): 回复内容
             priority (int): 1=命中该商品时优先回复，0=仅作为兜底
+            reply_once (int): 1=同一会话只触发一次，0=每条消息都触发
 
         Returns:
             bool: 更新成功返回True，失败返回False
@@ -7771,13 +7795,19 @@ class DBManager:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                     INSERT INTO item_replay
-                        (item_id, cookie_id, reply_content, priority, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        (item_id, cookie_id, reply_content, priority, reply_once,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT(cookie_id, item_id) DO UPDATE SET
                         reply_content = excluded.reply_content,
                         priority = excluded.priority,
+                        reply_once = excluded.reply_once,
                         updated_at = CURRENT_TIMESTAMP
-                ''', (item_id, cookie_id, reply_content, 1 if priority else 0))
+                ''', (
+                    item_id, cookie_id, reply_content,
+                    1 if priority else 0,
+                    1 if reply_once else 0,
+                ))
 
                 self.conn.commit()
             return True
@@ -7802,7 +7832,7 @@ class DBManager:
             with self.lock:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT r.item_id, r.cookie_id, r.reply_content, r.priority,
+                SELECT r.item_id, r.cookie_id, r.reply_content, r.priority, r.reply_once,
                        r.created_at, r.updated_at, i.item_title, i.item_detail
                     FROM item_replay r
                     LEFT JOIN item_info i
@@ -7818,6 +7848,8 @@ class DBManager:
                     item_info = dict(zip(columns, row))
                     if item_info.get('priority') is None:
                         item_info['priority'] = 1
+                    if item_info.get('reply_once') is None:
+                        item_info['reply_once'] = 1
                     items.append(item_info)
 
                 return items
@@ -7888,6 +7920,37 @@ class DBManager:
             return {"success_count": 0, "failed_count": len(items)}
 
         return {"success_count": success_count, "failed_count": failed_count}
+
+    def has_item_reply_record(self, cookie_id: str, chat_id: str, item_id: str) -> bool:
+        """同一会话是否已经触发过该商品的专属回复。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT 1 FROM item_reply_records
+                    WHERE cookie_id = ? AND chat_id = ? AND item_id = ?
+                    LIMIT 1
+                ''', (cookie_id, chat_id, item_id))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"读取商品回复触发记录失败: {e}")
+            return False
+
+    def add_item_reply_record(self, cookie_id: str, chat_id: str, item_id: str) -> bool:
+        """记录该商品的专属回复已在某会话触发过。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT OR IGNORE INTO item_reply_records
+                        (cookie_id, chat_id, item_id)
+                    VALUES (?, ?, ?)
+                ''', (cookie_id, chat_id, item_id))
+                self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"记录商品回复触发失败: {e}")
+            return False
 
     # ==================== 商品自动重新上架 ====================
 

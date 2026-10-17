@@ -882,10 +882,12 @@ export const updateItemReply = async (
     itemId: string,
     replyContent: string,
     priority = 1,
+    replyOnce = 1,
 ): Promise<ApiResponse> => {
     return put(`/item-reply/${cookieId}/${itemId}`, {
         reply_content: replyContent,
         priority,
+        reply_once: replyOnce,
     });
 };
 

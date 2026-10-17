@@ -7411,6 +7411,8 @@ class ItemReplyIn(BaseModel):
     reply_content: str
     # 1=命中该商品时优先回复；0=仅作为关键词/AI 未命中后的兜底
     priority: int = 1
+    # 1=同一会话只触发一次；0=每条消息都触发
+    reply_once: int = 1
 
 
 @app.put("/item-reply/{cookie_id}/{item_id}")
@@ -7441,15 +7443,21 @@ def update_item_reply(
             raise HTTPException(status_code=404, detail="商品不存在或不属于该账号")
 
         priority = 1 if data.priority else 0
+        reply_once = 1 if data.reply_once else 0
         if not db_manager.update_item_reply(
             cookie_id=cookie_id,
             item_id=item_id,
             reply_content=reply_content,
             priority=priority,
+            reply_once=reply_once,
         ):
             raise HTTPException(status_code=500, detail="保存商品回复失败")
 
-        return {"message": "商品回复更新成功", "priority": priority}
+        return {
+            "message": "商品回复更新成功",
+            "priority": priority,
+            "reply_once": reply_once,
+        }
 
     except HTTPException:
         raise
@@ -7532,6 +7540,7 @@ def get_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = 
             "cookie_id": cookie_id,
             "reply_content": item_reply.get("reply_content", ""),
             "priority": item_reply.get("priority", 1),
+            "reply_once": item_reply.get("reply_once", 1),
             "created_at": item_reply.get("created_at"),
             "updated_at": item_reply.get("updated_at"),
             "item_title": item_info.get("item_title", ""),

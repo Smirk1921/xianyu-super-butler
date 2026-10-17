@@ -502,6 +502,8 @@ export interface ItemReply {
   reply_content: string;
   /** 1=命中该商品时优先回复；0=仅作为关键词/AI 未命中后的兜底 */
   priority: number;
+  /** 1=同一会话只触发一次；0=每条消息都触发 */
+  reply_once?: number;
   item_title?: string;
   item_detail?: string;
   created_at?: string;
@@ -526,7 +528,8 @@ export interface ItemRelistSetting {
 
 export interface ItemRelistStockDetail {
   variant: string;
-  stock: number;
+  /** 批量卡密返回剩余条数；固定文本/图片/API 为 null */
+  stock: number | null;
   required: number;
 }
 
