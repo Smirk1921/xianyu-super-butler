@@ -85,6 +85,19 @@ class MessageIdentityTests(unittest.TestCase):
             )
         )
 
+    def test_item_status_filters_out_sold_items(self):
+        items = [
+            {'id': '1', 'item_status': 0},
+            {'id': '2', 'item_status': 1},
+            {'id': '3', 'item_status': '0'},
+            {'id': '4'},
+            {'id': '5', 'item_status': '1'},
+        ]
+        self.assertEqual(
+            XianyuLive._filter_on_sale_item_ids(items),
+            ['1', '3', '4'],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

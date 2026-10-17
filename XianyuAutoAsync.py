@@ -801,6 +801,8 @@ class XianyuLive:
         self.delivery_blocked_orders = set()  # 部分发货或内容已消耗的订单，阻止自动重试造成重复发送
         # 断线/漏事件后的待发货补发对账节流：order_id -> 上次尝试时间
         self._delivery_reconcile_attempts = {}
+        # 售出后即时上架检查的防抖：item_id -> 上次触发时间
+        self._relist_check_scheduled = {}
 
         # 交易卡片落库前暂存卖家端接口返回的真实成交数据（金额、数量、收货信息）
         self._pending_order_real_values = {}
@@ -1732,6 +1734,158 @@ class XianyuLive:
             self.cookies_str = new_cookies
 
         return result
+
+    async def _schedule_item_relist_check(self, item_id: str, reason: str = "售出"):
+        """售出后立即安排一次上架判定。
+
+        成交后平台更新“卖掉了”状态有延迟，先等 20 秒，再刷新一次商品状态，
+        然后立即判断该商品是否已下架、卡密是否还有余量。满足条件就执行上架，
+        不再等 5~15 分钟的定时循环。
+        """
+        if not item_id or item_id == "未知商品":
+            return
+
+        try:
+            from app.db_manager import db_manager
+            enabled = str(
+                db_manager.get_system_setting('auto_relist_enabled') or ''
+            ).strip().lower() in ('1', 'true', 'yes')
+            if not enabled:
+                return
+            user_id = self.user_id
+            if not user_id:
+                details = db_manager.get_cookie_details(self.cookie_id) or {}
+                user_id = details.get('user_id')
+            if not user_id:
+                return
+            setting = db_manager.get_item_relist_setting(
+                user_id, self.cookie_id, item_id
+            )
+            if not setting or not setting.get('enabled'):
+                return
+        except Exception as e:
+            logger.debug(
+                f"【{self.cookie_id}】读取自动上架配置失败: {self._safe_str(e)}"
+            )
+            return
+
+        now = time.time()
+        if now - self._relist_check_scheduled.get(item_id, 0) < 60:
+            return
+        self._relist_check_scheduled[item_id] = now
+
+        async def _run():
+            try:
+                # 等平台把商品更新成“卖掉了”
+                await self._interruptible_sleep(20)
+                async with self.item_sync_lock:
+                    await self.get_all_items(
+                        page_size=20,
+                        max_pages=self.item_sync_max_pages,
+                    )
+
+                from app.db_manager import db_manager
+                item = db_manager.get_item_info(self.cookie_id, item_id)
+                status = (item or {}).get('listing_status')
+                if status != 'off_shelf':
+                    logger.info(
+                        f"【{self.cookie_id}】商品 {item_id} {reason}后状态为 "
+                        f"{status or '未知'}，暂不需要上架"
+                    )
+                    return
+
+                from app.item_relist import ItemRelistService
+                service = ItemRelistService(db_manager)
+                cooldown = int(
+                    db_manager.get_system_setting('auto_relist_cooldown_minutes') or 60
+                )
+                setting = db_manager.get_item_relist_setting(
+                    user_id, self.cookie_id, item_id
+                ) or {}
+                candidate = {
+                    'cookie_id': self.cookie_id,
+                    'item_id': item_id,
+                    'listing_status': status,
+                    'last_seen_at': item.get('last_seen_at'),
+                    'last_attempt_at': setting.get('last_attempt_at'),
+                    'min_stock': setting.get('min_stock') or 1,
+                }
+                evaluation = service.check_eligibility(
+                    candidate, user_id, cooldown_minutes=cooldown
+                )
+                if not evaluation['eligible']:
+                    logger.info(
+                        f"【{self.cookie_id}】商品 {item_id} {reason}后上架判定不通过: "
+                        f"{evaluation['reason']}"
+                    )
+                    return
+
+                dry_run = str(
+                    db_manager.get_system_setting('auto_relist_dry_run') or 'true'
+                ).strip().lower() in ('1', 'true', 'yes')
+                if dry_run:
+                    logger.info(
+                        f"【{self.cookie_id}】[dry-run] 商品 {item_id} "
+                        f"{reason}后满足上架条件，库存={evaluation.get('stock')}"
+                    )
+                    service.record_attempt(
+                        user_id, self.cookie_id, item_id,
+                        'dry_run', f'{reason}后即时检查',
+                    )
+                    return
+
+                from utils.item_relist import load_relist_config, relist_item
+                relist_config = load_relist_config()
+                if (
+                    not relist_config.get('seller_url')
+                    or not relist_config.get('item_selector')
+                ):
+                    logger.warning(
+                        f"【{self.cookie_id}】商品 {item_id} {reason}后满足上架条件，"
+                        f"但未配置卖家页选择器，无法自动上架；请手动处理: "
+                        f"https://www.goofish.com/item?id={item_id}"
+                    )
+                    service.record_attempt(
+                        user_id, self.cookie_id, item_id,
+                        'skipped', '未配置卖家页选择器',
+                    )
+                    return
+
+                details = db_manager.get_cookie_details(self.cookie_id) or {}
+                result = await relist_item(
+                    self.cookie_id,
+                    self.cookies_str,
+                    item_id,
+                    headless=not bool(details.get('show_browser')),
+                )
+                if result.get('success'):
+                    db_manager.set_item_listing_pending(self.cookie_id, item_id)
+                    service.record_attempt(
+                        user_id, self.cookie_id, item_id,
+                        'success', result.get('message', ''),
+                    )
+                    logger.info(
+                        f"【{self.cookie_id}】商品 {item_id} {reason}后已重新上架"
+                    )
+                else:
+                    service.record_attempt(
+                        user_id, self.cookie_id, item_id,
+                        'failed', result.get('reason', ''),
+                    )
+                    logger.warning(
+                        f"【{self.cookie_id}】商品 {item_id} {reason}后重新上架失败: "
+                        f"{result.get('reason', '')}；手动处理: "
+                        f"https://www.goofish.com/item?id={item_id}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"【{self.cookie_id}】商品 {item_id} {reason}后即时上架检查失败: "
+                    f"{self._safe_str(e)}"
+                )
+
+        self._create_tracked_task(_run())
 
     async def _reconcile_pending_deliveries(self):
         """补发对账：处理断线或消息漏收导致的待发货订单。
@@ -4376,6 +4530,19 @@ class XianyuLive:
             logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
             return await self.get_item_info(item_id, retry_count + 1)
+
+    @staticmethod
+    def _filter_on_sale_item_ids(items):
+        """只保留 itemStatus=0 的商品 ID。
+
+        已售出/下架的商品仍然会出现在“我发布的”列表里，只是 itemStatus≠0，
+        不能把它们算进在售集合，否则上下架校准永远判不出已下架。
+        """
+        return [
+            item.get('id')
+            for item in items
+            if str(item.get('item_status', 0)).strip() == '0'
+        ]
 
     @staticmethod
     def _is_card_update_message(message: dict) -> bool:
@@ -7699,6 +7866,23 @@ class XianyuLive:
                             )
                             continue
 
+                        from utils.item_relist import load_relist_config
+                        relist_config = load_relist_config()
+                        if (
+                            not relist_config.get('seller_url')
+                            or not relist_config.get('item_selector')
+                        ):
+                            logger.warning(
+                                f"【{self.cookie_id}】商品 {item_id} 满足上架条件，"
+                                f"但未配置卖家页选择器，无法自动上架；请手动处理: "
+                                f"https://www.goofish.com/item?id={item_id}"
+                            )
+                            service.record_attempt(
+                                user_id, self.cookie_id, item_id, 'skipped',
+                                '未配置卖家页选择器',
+                            )
+                            continue
+
                         try:
                             from utils.item_relist import relist_item
                             details = db_manager.get_cookie_details(self.cookie_id) or {}
@@ -10581,6 +10765,8 @@ class XianyuLive:
             # 【优先处理】检查系统消息和自动发货触发消息（不受人工接入暂停影响）
             if self._is_auto_delivery_trigger(send_message):
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】检测到自动发货触发消息，进入订单校验')
+                # 售出后立即安排一次上架判定，不再等定时循环
+                await self._schedule_item_relist_check(item_id, "付款")
                 await self._handle_auto_delivery(
                     websocket, message, send_user_name, send_user_id,
                     item_id, chat_id, msg_time
@@ -10636,6 +10822,8 @@ class XianyuLive:
             # 【重要】检查是否为自动发货触发消息 - 即使在人工接入暂停期间也要处理
             elif self._is_auto_delivery_trigger(send_message):
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】检测到自动发货触发消息，即使在暂停期间也继续处理: {send_message}')
+                # 售出后立即安排一次上架判定
+                await self._schedule_item_relist_check(item_id, "付款")
                 # 使用统一的自动发货处理方法
                 await self._handle_auto_delivery(websocket, message, send_user_name, send_user_id,
                                                item_id, chat_id, msg_time)
@@ -11721,8 +11909,17 @@ class XianyuLive:
             )
         else:
             from app.db_manager import db_manager
+            # itemStatus=0 在售；非 0（实测 1=已售出/下架）也要标成下架。
+            # 已售出的商品仍会出现在“我发布的”列表里，只按“是否返回”判断会永远留在 on_sale。
+            on_sale_ids = self._filter_on_sale_item_ids(all_items)
+            sold_in_list = len(all_items) - len(on_sale_ids)
+            if sold_in_list:
+                logger.info(
+                    f"【{self.cookie_id}】本次同步发现 {sold_in_list} 件已售出/下架商品"
+                    f"（itemStatus≠0），将标记为已下架"
+                )
             stats = db_manager.reconcile_item_listing_status(
-                self.cookie_id, [item.get('id') for item in all_items]
+                self.cookie_id, on_sale_ids
             )
             off_shelf_count = stats.get('off_shelf', 0)
 
