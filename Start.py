@@ -221,6 +221,7 @@ def _check_and_install_playwright():
     # 各平台的浏览器可执行文件相对路径。
     # 新版 Playwright 在 macOS 上改用 Chrome for Testing，旧版是 Chromium。
     browser_exe_candidates = (
+        Path('chrome-win64') / 'chrome.exe',
         Path('chrome-win') / 'chrome.exe',
         Path('chrome-mac') / 'Chromium.app' / 'Contents' / 'MacOS' / 'Chromium',
         Path('chrome-mac-arm64') / 'Chromium.app' / 'Contents' / 'MacOS' / 'Chromium',
