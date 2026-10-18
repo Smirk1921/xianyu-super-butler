@@ -363,7 +363,10 @@ async def check_seller_session(
             "status": "ok",
             "reason": "",
             "cookies_str": working_cookies,
-            "preflight": preflight,
+            # 不要把 Cookie 再塞进诊断信息，避免接口/日志泄漏
+            "preflight": {
+                key: value for key, value in preflight.items() if key != "cookies_str"
+            },
         }
     except asyncio.CancelledError:
         raise

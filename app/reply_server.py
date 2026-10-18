@@ -7722,8 +7722,10 @@ async def check_item_relist_session(
             f"seller_session_checked_at_{cookie_id}",
             time.strftime("%Y-%m-%d %H:%M:%S"),
         )
-        # 不把完整 Cookie 返回给前端
-        public_result = {k: v for k, v in result.items() if k != "cookies_str"}
+        # 不把完整 Cookie/预刷新细节返回给前端
+        public_result = {
+            k: v for k, v in result.items() if k not in ("cookies_str", "preflight")
+        }
         return {"success": status == "ok", **public_result}
     except HTTPException:
         raise
