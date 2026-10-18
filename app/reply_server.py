@@ -7682,6 +7682,55 @@ def run_item_relist(
         raise HTTPException(status_code=500, detail=f"自动上架检查失败: {str(e)}")
 
 
+@app.post("/item-relist/session-check/{cookie_id}")
+async def check_item_relist_session(
+    cookie_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动检查卖家工作台登录态，并把刷新后的 Cookie 写回账号。"""
+    try:
+        from app.db_manager import db_manager
+
+        user_id = current_user["user_id"]
+        if cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
+
+        details = db_manager.get_cookie_details(cookie_id) or {}
+        cookies_str = details.get("value") or ""
+        if not cookies_str:
+            raise HTTPException(status_code=400, detail="账号没有可用 Cookie")
+
+        from utils.item_relist import check_seller_session
+        result = await check_seller_session(
+            cookie_id,
+            cookies_str,
+            headless=not bool(details.get("show_browser")),
+        )
+
+        new_cookies = result.get("cookies_str")
+        if new_cookies:
+            db_manager.update_cookie_value(cookie_id, new_cookies)
+
+        status = str(result.get("status") or "error")
+        db_manager.set_system_setting(
+            f"seller_session_status_{cookie_id}", status, "卖家工作台登录态"
+        )
+        db_manager.set_system_setting(
+            f"seller_session_reason_{cookie_id}", result.get("reason") or ""
+        )
+        db_manager.set_system_setting(
+            f"seller_session_checked_at_{cookie_id}",
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        # 不把完整 Cookie 返回给前端
+        public_result = {k: v for k, v in result.items() if k != "cookies_str"}
+        return {"success": status == "ok", **public_result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"检查卖家工作台登录态失败: {str(e)}")
+
+
 @app.get("/item-relist/logs")
 def get_item_relist_logs(
     limit: int = 100,

@@ -18,7 +18,15 @@ from datetime import datetime, timedelta
 
 from app.db_manager import DBManager
 from app.item_relist import ItemRelistService
-from utils.item_relist import build_stock_targets, normalize_stock, relist_item
+from utils.item_relist import (
+    browser_cookies_to_string,
+    build_stock_targets,
+    check_seller_session,
+    merge_cookie_strings,
+    normalize_stock,
+    parse_cookie_string,
+    relist_item,
+)
 
 
 class ItemRelistTests(unittest.TestCase):
@@ -320,6 +328,67 @@ class RelistExecutorTest(unittest.TestCase):
         )
         self.assertFalse(result["success"])
         self.assertIn("库存目标为 0", result["reason"])
+
+
+class RelistCookieHelpersTest(unittest.TestCase):
+    """Cookie 合并/导出与会话检查的纯函数测试。"""
+
+    def test_parse_cookie_string_ignores_broken_pairs(self):
+        self.assertEqual(
+            parse_cookie_string("a=1; b=2; broken; =empty"),
+            {"a": "1", "b": "2"},
+        )
+
+    def test_merge_later_values_win(self):
+        merged = merge_cookie_strings("a=1; b=2", "b=3; c=4")
+        self.assertEqual(
+            parse_cookie_string(merged),
+            {"a": "1", "b": "3", "c": "4"},
+        )
+
+    def test_browser_cookies_filter_and_goofish_priority(self):
+        cookies = [
+            {"name": "cookie2", "value": "taobao", "domain": ".taobao.com"},
+            {"name": "cookie2", "value": "goofish", "domain": ".goofish.com"},
+            {"name": "cna", "value": "third-party", "domain": ".alicdn.com"},
+        ]
+        parsed = parse_cookie_string(browser_cookies_to_string(cookies))
+        self.assertEqual(parsed["cookie2"], "goofish")
+        self.assertNotIn("cna", parsed)
+
+    def test_check_session_without_cookie_requires_login(self):
+        result = asyncio.run(check_seller_session("acc", "", headless=True))
+        self.assertEqual(result["status"], "login_required")
+
+
+class CookieStorageTest(unittest.TestCase):
+    """增量刷新 Cookie 时不能清空账号其他字段。"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manager = DBManager(os.path.join(self.temp_dir.name, "cookie.db"))
+        user_id = self.manager.conn.execute(
+            "SELECT id FROM users WHERE username='admin'"
+        ).fetchone()[0]
+        self.manager.conn.execute(
+            "INSERT INTO cookies (id, value, user_id, remark, show_browser) "
+            "VALUES ('acc', 'old=1', ?, 'keep-me', 1)",
+            (user_id,),
+        )
+        self.manager.conn.commit()
+
+    def tearDown(self):
+        self.manager.close()
+        self.temp_dir.cleanup()
+
+    def test_update_cookie_value_preserves_other_columns(self):
+        self.assertTrue(self.manager.update_cookie_value("acc", "new=2"))
+        row = self.manager.conn.execute(
+            "SELECT value, remark, show_browser FROM cookies WHERE id='acc'"
+        ).fetchone()
+        self.assertEqual(row[0], "new=2")
+        self.assertEqual(row[1], "keep-me")
+        self.assertEqual(row[2], 1)
 
 
 if __name__ == "__main__":

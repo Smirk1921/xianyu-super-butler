@@ -2243,6 +2243,26 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    def update_cookie_value(self, cookie_id: str, cookie_value: str) -> bool:
+        """只更新 Cookie 值，保留用户名、密码、备注、显示浏览器等列。
+
+        不能用 ``save_cookie`` 做增量刷新：它走 ``INSERT OR REPLACE``，
+        REPLACE 会先删行再插入，未提供的列会被重置为默认值。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor,
+                    "UPDATE cookies SET value = ? WHERE id = ?",
+                    (cookie_value, cookie_id)
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新Cookie值失败: {e}")
+                self.conn.rollback()
+                return False
+
     
     def delete_cookie(self, cookie_id: str) -> bool:
         """从数据库删除Cookie及其关键字"""

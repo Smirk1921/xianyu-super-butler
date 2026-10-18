@@ -21,6 +21,7 @@ from app.config import (
 )
 from app.config import config as cfg  # 导入config实例（不是模块），使用别名避免冲突
 import sys
+from typing import Any, Dict
 import aiohttp
 from collections import defaultdict
 from app.db_manager import db_manager
@@ -302,6 +303,9 @@ class XianyuLive:
         if self.item_relist_task:
             status = "已完成" if self.item_relist_task.done() else "运行中"
             other_tasks_status.append(f"自动重新上架任务({status})")
+        if self.seller_session_task:
+            status = "已完成" if self.seller_session_task.done() else "运行中"
+            other_tasks_status.append(f"卖家登录态检查({status})")
         if self.delivery_timeout_task:
             status = "已完成" if self.delivery_timeout_task.done() else "运行中"
             other_tasks_status.append(f"发货超时检查({status})")
@@ -370,6 +374,12 @@ class XianyuLive:
                 else:
                     logger.debug(f"【{self.cookie_id}】自动重新上架任务已完成，跳过")
 
+            if self.seller_session_task:
+                if not self.seller_session_task.done():
+                    tasks_to_cancel.append(("卖家登录态检查", self.seller_session_task))
+                else:
+                    logger.debug(f"【{self.cookie_id}】卖家登录态检查已完成，跳过")
+
             if self.delivery_timeout_task:
                 if not self.delivery_timeout_task.done():
                     tasks_to_cancel.append(("发货超时检查", self.delivery_timeout_task))
@@ -393,6 +403,7 @@ class XianyuLive:
                 self.order_sync_task = None
                 self.item_polish_task = None
                 self.item_relist_task = None
+                self.seller_session_task = None
                 self.delivery_timeout_task = None
                 self.buyer_interaction_task = None
                 return
@@ -533,6 +544,7 @@ class XianyuLive:
             self.order_sync_task = None
             self.item_polish_task = None
             self.item_relist_task = None
+            self.seller_session_task = None
             self.delivery_timeout_task = None
             self.buyer_interaction_task = None
             logger.info(f"【{self.cookie_id}】后台任务引用已全部重置")
@@ -838,6 +850,8 @@ class XianyuLive:
         # 售完下架后按卡密余量自动重新上架，默认关闭且默认 dry-run
         self.item_relist_task = None
         self.last_item_relist_check_time = 0
+        # 卖家工作台登录态定时检查（主站 WebSocket 正常不代表卖家网页登录有效）
+        self.seller_session_task = None
 
         # 发货超时告警：记录已提醒过的订单，避免重复推送
         self.delivery_timeout_task = None
@@ -1735,6 +1749,90 @@ class XianyuLive:
 
         return result
 
+    # ------------------------------------------------------------------
+    # 卖家工作台登录态 / Cookie 回写
+    # ------------------------------------------------------------------
+    def _seller_session_key(self, suffix: str) -> str:
+        return f"seller_session_{suffix}_{self.cookie_id}"
+
+    def _get_seller_session_status(self) -> str:
+        try:
+            from app.db_manager import db_manager
+            return str(db_manager.get_system_setting(
+                self._seller_session_key('status')
+            ) or '').strip()
+        except Exception:
+            return ''
+
+    def _seller_session_blocked(self) -> bool:
+        return self._get_seller_session_status() in ('login_required', 'challenge')
+
+    def _set_seller_session_status(self, status: str, reason: str = '') -> None:
+        """写入卖家工作台登录态，并在状态变化时发送通知。
+
+        主站 WebSocket 正常不代表 seller.goofish.com 的网页登录有效，
+        所以这个状态单独存一份，自动上架执行前先看它。
+        """
+        try:
+            from app.db_manager import db_manager
+            previous = self._get_seller_session_status()
+            db_manager.set_system_setting(self._seller_session_key('status'), status)
+            db_manager.set_system_setting(self._seller_session_key('reason'), reason or '')
+            db_manager.set_system_setting(
+                self._seller_session_key('checked_at'),
+                time.strftime('%Y-%m-%d %H:%M:%S'),
+            )
+            if status == previous:
+                return
+
+            message = ''
+            title = ''
+            level = 'info'
+            if status in ('login_required', 'challenge'):
+                title = '卖家工作台登录失效，自动上架已暂停'
+                message = (
+                    f"账号 {self.cookie_id} 的鱼小铺卖家工作台登录态不可用："
+                    f"{reason or status}。请到后台重新扫码登录该账号；"
+                    "恢复前自动上架会跳过，不会反复重试。"
+                )
+                level = 'warning'
+            elif status == 'ok' and previous in ('login_required', 'challenge'):
+                title = '卖家工作台登录已恢复'
+                message = f"账号 {self.cookie_id} 的卖家工作台登录态已恢复，自动上架继续工作。"
+                level = 'success'
+
+            if title:
+                try:
+                    from utils.slider_patch import send_notification
+                    send_notification(self.cookie_id, title, message, level)
+                except Exception as notify_error:
+                    logger.debug(f"【{self.cookie_id}】卖家登录态通知发送失败: {notify_error}")
+            logger.info(
+                f"【{self.cookie_id}】卖家工作台登录态: {previous or '未知'} -> {status}"
+                + (f"（{reason}）" if reason else '')
+            )
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】写入卖家工作台登录态失败: {self._safe_str(e)}")
+
+    def _write_back_relist_cookies(self, result: Dict[str, Any]) -> None:
+        """把执行器/健康检查刷新出来的 Cookie 写回内存和数据库。"""
+        new_cookies = str(result.get('cookies_str') or '').strip()
+        if not new_cookies or new_cookies == self.cookies_str:
+            return
+        try:
+            self.cookies_str = new_cookies
+            from app.db_manager import db_manager
+            db_manager.update_cookie_value(self.cookie_id, new_cookies)
+            try:
+                from app.cookie_manager import manager as cookie_manager
+                if cookie_manager and getattr(cookie_manager, 'cookies', None) is not None:
+                    cookie_manager.cookies[self.cookie_id] = new_cookies
+            except Exception:
+                pass
+            logger.debug(f"【{self.cookie_id}】已回写卖家页刷新后的 Cookie")
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】回写 Cookie 失败: {self._safe_str(e)}")
+
     async def _schedule_item_relist_check(self, item_id: str, reason: str = "售出"):
         """售出后立即安排一次上架判定。
 
@@ -1766,6 +1864,13 @@ class XianyuLive:
         except Exception as e:
             logger.debug(
                 f"【{self.cookie_id}】读取自动上架配置失败: {self._safe_str(e)}"
+            )
+            return
+
+        if self._seller_session_blocked():
+            logger.info(
+                f"【{self.cookie_id}】卖家工作台登录态失效，跳过商品 {item_id} 的"
+                f"即时上架检查；恢复后由定时检查补上"
             )
             return
 
@@ -1847,7 +1952,9 @@ class XianyuLive:
                     stock_targets=stock_targets,
                     headless=not bool(details.get('show_browser')),
                 )
+                self._write_back_relist_cookies(result)
                 if result.get('success'):
+                    self._set_seller_session_status('ok', '')
                     db_manager.set_item_listing_pending(self.cookie_id, item_id)
                     service.record_attempt(
                         user_id, self.cookie_id, item_id,
@@ -1857,6 +1964,10 @@ class XianyuLive:
                         f"【{self.cookie_id}】商品 {item_id} {reason}后已重新上架"
                     )
                 else:
+                    if result.get('login_required'):
+                        self._set_seller_session_status(
+                            'login_required', result.get('reason', '')
+                        )
                     service.record_attempt(
                         user_id, self.cookie_id, item_id,
                         'failed', result.get('reason', ''),
@@ -7844,6 +7955,15 @@ class XianyuLive:
                             f"可上架 {len(eligible)} 个"
                         )
 
+                    if eligible and not dry_run and self._seller_session_blocked():
+                        logger.info(
+                            f"【{self.cookie_id}】卖家工作台登录态失效，"
+                            f"本轮跳过 {len(eligible)} 个候选；请重新扫码登录"
+                        )
+                        self.last_item_relist_check_time = time.time()
+                        await self._interruptible_sleep(interval)
+                        continue
+
                     for candidate in eligible[:max_per_run]:
                         item_id = candidate.get('item_id')
                         if dry_run:
@@ -7882,7 +8002,9 @@ class XianyuLive:
                             )
                             continue
 
+                        self._write_back_relist_cookies(result)
                         if result.get('success'):
+                            self._set_seller_session_status('ok', '')
                             db_manager.set_item_listing_pending(self.cookie_id, item_id)
                             service.record_attempt(
                                 user_id, self.cookie_id, item_id, 'success',
@@ -7890,6 +8012,10 @@ class XianyuLive:
                             )
                             logger.info(f"【{self.cookie_id}】商品 {item_id} 已重新上架")
                         else:
+                            if result.get('login_required'):
+                                self._set_seller_session_status(
+                                    'login_required', result.get('reason', '')
+                                )
                             service.record_attempt(
                                 user_id, self.cookie_id, item_id, 'failed',
                                 result.get('reason', ''),
@@ -7917,6 +8043,87 @@ class XianyuLive:
         finally:
             logger.info(f"【{self.cookie_id}】自动重新上架循环已退出")
 
+
+    async def seller_session_check_loop(self):
+        """定时检查鱼小铺卖家工作台登录态。
+
+        主站 WebSocket 正常不代表 seller.goofish.com 的网页登录有效；这套
+        会话会单独过期。检查到登录页/验证页时写入状态并通知，自动上架在
+        恢复前直接跳过，避免反复失败和浪费冷却时间。
+        """
+        await self._interruptible_sleep(random.uniform(0, 120))
+        try:
+            while True:
+                try:
+                    from app.cookie_manager import manager as cookie_manager
+                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                        logger.info(f"【{self.cookie_id}】账号已禁用，停止卖家登录态检查循环")
+                        break
+
+                    from app.db_manager import db_manager
+                    enabled = str(
+                        db_manager.get_system_setting('auto_relist_enabled') or ''
+                    ).strip().lower() in ('1', 'true', 'yes')
+                    if not enabled:
+                        await self._interruptible_sleep(300)
+                        continue
+
+                    try:
+                        interval = int(
+                            db_manager.get_system_setting('seller_session_check_interval') or 1800
+                        )
+                    except (TypeError, ValueError):
+                        interval = 1800
+                    interval = max(600, interval)
+
+                    from utils import risk_control
+                    guard = risk_control.registry.get(self.cookie_id)
+                    if guard.is_blocked:
+                        wait = min(guard.remaining_seconds + 5, 300)
+                        logger.debug(
+                            f"【{self.cookie_id}】风控冷却中，{wait} 秒后再检查卖家登录态"
+                        )
+                        await self._interruptible_sleep(wait)
+                        continue
+
+                    details = db_manager.get_cookie_details(self.cookie_id) or {}
+                    from utils.item_relist import check_seller_session
+                    result = await check_seller_session(
+                        self.cookie_id,
+                        self.cookies_str,
+                        headless=not bool(details.get('show_browser')),
+                    )
+                    self._write_back_relist_cookies(result)
+
+                    status = str(result.get('status') or 'error')
+                    reason = str(result.get('reason') or '')
+                    if status == 'ok':
+                        self._set_seller_session_status('ok', '')
+                    elif status in ('login_required', 'challenge'):
+                        self._set_seller_session_status(status, reason)
+                    else:
+                        logger.warning(
+                            f"【{self.cookie_id}】卖家工作台登录态检查异常: {reason}"
+                        )
+
+                    await self._interruptible_sleep(interval)
+
+                except asyncio.CancelledError:
+                    logger.info(f"【{self.cookie_id}】卖家登录态检查收到取消信号，准备退出")
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"【{self.cookie_id}】卖家登录态检查失败: {self._safe_str(e)}"
+                    )
+                    try:
+                        await self._interruptible_sleep(300)
+                    except asyncio.CancelledError:
+                        raise
+        except asyncio.CancelledError:
+            logger.info(f"【{self.cookie_id}】卖家登录态检查循环已取消，正在退出...")
+            raise
+        finally:
+            logger.info(f"【{self.cookie_id}】卖家登录态检查循环已退出")
 
     async def delivery_timeout_loop(self):
         """发货超时告警。
@@ -10624,6 +10831,8 @@ class XianyuLive:
                     return
 
                 message_1 = message["1"]
+                # 订单卡片分支不会赋值 message_10，通知代码仍会用到
+                message_10 = {}
                 if isinstance(message_1, dict):
                     message_10 = message_1.get("10")
                     if not isinstance(message_10, dict):
@@ -11022,6 +11231,14 @@ class XianyuLive:
                                 tasks_started.append("自动重新上架")
                             else:
                                 logger.info(f"【{self.cookie_id}】自动重新上架任务已在运行，跳过启动")
+
+                            # 启动卖家工作台登录态检查（主站在线不代表卖家网页登录有效）
+                            if not self.seller_session_task or self.seller_session_task.done():
+                                logger.info(f"【{self.cookie_id}】启动卖家工作台登录态检查任务...")
+                                self.seller_session_task = asyncio.create_task(self.seller_session_check_loop())
+                                tasks_started.append("卖家登录态检查")
+                            else:
+                                logger.info(f"【{self.cookie_id}】卖家登录态检查任务已在运行，跳过启动")
 
                             # 启动发货超时检查：超时未发货会被平台处罚
                             if not self.delivery_timeout_task or self.delivery_timeout_task.done():
