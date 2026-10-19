@@ -2326,7 +2326,11 @@ class XianyuLive:
 
                                 else:
                                     # 普通文本发货内容
-                                    await self.send_msg(websocket, chat_id, send_user_id, delivery_content)
+                                    # 优先用带平台回执的发送方式，避免 ws.send 成功但实际没送达
+                                    if getattr(self, 'ws', None) is not None:
+                                        await self.send_im_text(chat_id, send_user_id, delivery_content)
+                                    else:
+                                        await self.send_msg(websocket, chat_id, send_user_id, delivery_content)
                                     if len(delivery_contents) > 1:
                                         logger.info(f'[{msg_time}] 【多数量自动发货】第 {i+1}/{len(delivery_contents)} 条已向 {user_url} 发送发货内容')
                                     else:
@@ -6759,6 +6763,10 @@ class XianyuLive:
                             batch_queue = db_manager.consume_batch_data_batch(
                                 rule['card_id'],
                                 required_count,
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=send_user_id,
+                                cookie_id=self.cookie_id,
                             )
                             if not batch_queue:
                                 logger.warning(
@@ -6776,7 +6784,13 @@ class XianyuLive:
                             return None
                         delivery_content = batch_queue.pop(0)
                     else:
-                        delivery_content = db_manager.consume_batch_data(rule['card_id'])
+                        delivery_content = db_manager.consume_batch_data(
+                            rule['card_id'],
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=send_user_id,
+                            cookie_id=self.cookie_id,
+                        )
 
                 elif rule['card_type'] == 'image':
                     # 图片类型：返回图片发送标记，包含卡券ID

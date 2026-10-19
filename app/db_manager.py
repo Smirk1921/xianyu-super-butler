@@ -259,6 +259,12 @@ class DBManager:
                 "CREATE INDEX IF NOT EXISTS idx_card_shipments_user_time "
                 "ON card_shipments(user_id, id DESC)"
             )
+            # 发货前要按 (card_id, content) 检查是否已经发过，避免同一张卡密被重复消费。
+            # 历史上已经存在重复记录，不能直接建唯一索引，唯一性由 consume_batch_data_batch 保证。
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_card_shipments_card_content "
+                "ON card_shipments(card_id, content)"
+            )
 
             # 创建订单表
             cursor.execute('''
@@ -4669,6 +4675,29 @@ class DBManager:
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
+    @staticmethod
+    def _normalize_data_content(data_content: str = None) -> str:
+        """批量卡密入库/更新时去空白、去空行、去重复行。
+
+        同一行卡密被粘贴两次时，旧逻辑会把它当成两份库存，可能卖给两个买家。
+        这里保留第一次出现的顺序，重复行只保留一份并记录警告。
+        """
+        lines = []
+        seen = set()
+        duplicates = 0
+        for raw_line in (data_content or '').splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line in seen:
+                duplicates += 1
+                continue
+            seen.add(line)
+            lines.append(line)
+        if duplicates:
+            logger.warning(f"批量卡密包含 {duplicates} 条重复内容，已自动去重")
+        return '\n'.join(lines)
+
     def create_card(self, name: str, card_type: str, api_config=None,
                    text_content: str = None, data_content: str = None, image_url: str = None,
                    description: str = None, enabled: bool = True, delay_seconds: int = 0,
@@ -4712,6 +4741,9 @@ class DBManager:
                         api_config_str = json.dumps(api_config)
                     else:
                         api_config_str = str(api_config)
+
+                if data_content is not None:
+                    data_content = self._normalize_data_content(data_content)
 
                 cursor.execute('''
                 INSERT INTO cards (name, type, api_config, text_content, data_content, image_url,
@@ -4876,6 +4908,9 @@ class DBManager:
                         api_config_str = json.dumps(api_config)
                     else:
                         api_config_str = str(api_config)
+
+                if data_content is not None:
+                    data_content = self._normalize_data_content(data_content)
 
                 cursor = self.conn.cursor()
 
@@ -5593,6 +5628,32 @@ class DBManager:
 
                 consumed_lines = lines[:requested_quantity]
                 remaining_lines = lines[requested_quantity:]
+
+                # 同一张卡密只能发一次。库存里如果还留着已发货过的重复行，
+                # 宁可直接拒绝并提示清理，也不能再卖给第二个买家。
+                if len(set(consumed_lines)) != len(consumed_lines):
+                    logger.error(
+                        f"拒绝重复消费: 卡券ID={card_id} 本次待发货内容内部存在重复行，"
+                        "请先清理库存中的重复卡密"
+                    )
+                    return None
+                for content in consumed_lines:
+                    duplicate = cursor.execute(
+                        "SELECT 1 FROM card_shipments WHERE card_id = ? AND content = ? LIMIT 1",
+                        (card_id, content),
+                    ).fetchone()
+                    if duplicate:
+                        import hashlib
+                        fingerprint = hashlib.sha256(
+                            content.encode("utf-8", "ignore")
+                        ).hexdigest()[:12]
+                        logger.error(
+                            f"拒绝重复消费: 卡券ID={card_id} 的待发货内容已存在发货记录 "
+                            f"(order_id={order_id or ''}, 内容指纹={fingerprint})；"
+                            "请清理库存中的重复卡密后再发货"
+                        )
+                        return None
+
                 new_data_content = '\n'.join(remaining_lines)
 
                 cursor.execute('''
