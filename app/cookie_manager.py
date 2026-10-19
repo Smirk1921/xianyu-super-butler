@@ -417,7 +417,12 @@ class CookieManager:
     def update_cookie_status(self, cookie_id: str, enabled: bool):
         """更新Cookie的启用/禁用状态"""
         if cookie_id not in self.cookies:
-            raise ValueError(f"Cookie ID {cookie_id} 不存在")
+            # 账号停用期间可能不在内存字典里（例如重启后只加载了运行中的账号），
+            # 启用时先从数据库补回来，否则会误报“Cookie ID 不存在”。
+            fresh_cookies = db_manager.get_all_cookies()
+            if cookie_id not in fresh_cookies:
+                raise ValueError(f"Cookie ID {cookie_id} 不存在")
+            self.cookies[cookie_id] = fresh_cookies[cookie_id]
 
         old_status = self.cookie_status.get(cookie_id, True)
         self.cookie_status[cookie_id] = enabled
