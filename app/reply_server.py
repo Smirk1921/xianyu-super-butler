@@ -9627,17 +9627,25 @@ async def start_manual_captcha(
             log_with_user('info', f"账号 {cookie_id} 已清除过期的验证挑战标记", current_user)
         result['cookies_str'] = cleaned_cookies
 
+        # 人工验证回来的 Cookie 可能只有 x5sec 系列；直接覆盖会把 _m_h5_tk
+        # 和账号其他字段一起冲掉，必须与现有 Cookie 合并后只更新 value。
+        existing_cookies = (db_manager.get_cookie_details(cookie_id) or {}).get('value') or ''
+        from utils.item_relist import merge_cookie_strings, parse_cookie_string
+        merged_cookies = merge_cookie_strings(existing_cookies, cleaned_cookies)
+        result['cookies_str'] = merged_cookies
+
         # 保存新 Cookie 并解除风控熔断，让账号能立刻重连
-        db_manager.save_cookie(cookie_id, result['cookies_str'])
+        db_manager.update_cookie_value(cookie_id, merged_cookies)
 
         # 运行中的实例仍持有旧 Cookie，不同步会继续用旧值打接口并立刻再次熔断
         try:
             manager = cookie_manager.manager
             if manager is not None:
-                manager.cookies[cookie_id] = result['cookies_str']
+                manager.cookies[cookie_id] = merged_cookies
                 instance = manager.instances.get(cookie_id)
                 if instance is not None:
-                    instance.cookies_str = result['cookies_str']
+                    instance.cookies_str = merged_cookies
+                    instance.cookies = parse_cookie_string(merged_cookies)
                     # 清掉失效令牌，强制下次请求重新获取
                     instance.current_token = None
                     log_with_user('info', f"账号 {cookie_id} 运行实例已同步新 Cookie", current_user)
@@ -9698,16 +9706,76 @@ async def get_fresh_captcha_url(
     from utils.xianyu_utils import trans_cookies, generate_sign, generate_device_id
 
     cookies_str = user_cookies[cookie_id]
+    # 运行中的实例可能持有比数据库更新的 Cookie，优先用它
+    try:
+        manager = cookie_manager.manager
+        if manager is not None:
+            instance = manager.instances.get(cookie_id)
+            if instance is not None and getattr(instance, 'cookies_str', None):
+                cookies_str = instance.cookies_str
+            elif manager.cookies.get(cookie_id):
+                cookies_str = manager.cookies.get(cookie_id)
+    except Exception:
+        pass
+
     try:
         cookie_dict = trans_cookies(cookies_str)
     except ValueError:
         raise HTTPException(status_code=400, detail='账号 Cookie 为空，请重新扫码登录')
 
     token = (cookie_dict.get('_m_h5_tk') or '').split('_')[0]
+
+    # 人工验证失败时，旧流程可能把只含 x5secdata 的残缺 Cookie 写进数据库，
+    # 导致 _m_h5_tk 丢失，进而这里返回 409，用户连验证页都打不开。
+    # 卖家端接口会在 Set-Cookie 里下发新的 _m_h5_tk，先自动补回再继续。
+    if not token:
+        try:
+            from utils.item_relist import merge_cookie_strings, parse_cookie_string
+            from utils.xianyu_seller_api import XianyuSellerAPI
+
+            async with XianyuSellerAPI(cookie_id, cookies_str) as seller_api:
+                try:
+                    await seller_api.get_sold_orders(
+                        page_number=1, rows_per_page=1, query_code='ALL'
+                    )
+                except Exception as sold_error:
+                    log_with_user(
+                        'warning',
+                        f'自动补回 _m_h5_tk 时卖家接口返回失败（继续尝试）: {sold_error}',
+                        current_user,
+                    )
+                cookies_str = merge_cookie_strings(cookies_str, seller_api.cookies_str)
+
+            cookie_dict = trans_cookies(cookies_str)
+            token = (cookie_dict.get('_m_h5_tk') or '').split('_')[0]
+            if token:
+                db_manager.update_cookie_value(cookie_id, cookies_str)
+                try:
+                    manager = cookie_manager.manager
+                    if manager is not None:
+                        manager.cookies[cookie_id] = cookies_str
+                        instance = manager.instances.get(cookie_id)
+                        if instance is not None:
+                            instance.cookies_str = cookies_str
+                            instance.cookies = parse_cookie_string(cookies_str)
+                except Exception as sync_error:
+                    log_with_user(
+                        'warning',
+                        f'同步补回的 Cookie 到运行实例失败: {sync_error}',
+                        current_user,
+                    )
+                log_with_user('info', '已通过卖家端接口补回 _m_h5_tk', current_user)
+        except Exception as bootstrap_error:
+            log_with_user(
+                'warning',
+                f'自动补回 _m_h5_tk 异常: {bootstrap_error}',
+                current_user,
+            )
+
     if not token:
         raise HTTPException(
             status_code=409,
-            detail='账号 Cookie 缺少 _m_h5_tk 字段，请重新扫码登录',
+            detail='账号 Cookie 缺少 _m_h5_tk，自动补回失败，请重新扫码登录',
         )
 
     timestamp = str(int(time.time() * 1000))
