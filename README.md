@@ -7,7 +7,7 @@
 **本项目征集PR、功能更新，任何一个提交PR的作者会在未来获得顶配模型token奖励**
 
 [![GitHub Stars](https://img.shields.io/github/stars/23Star/xianyu-super-butler?style=flat&logo=github&color=f5b301)](https://github.com/23Star/xianyu-super-butler/stargazers)
-[![Version](https://img.shields.io/badge/Version-3.1.0-52c41a)](https://github.com/23Star/xianyu-super-butler/releases)
+[![Version](https://img.shields.io/badge/Version-3.3.0-52c41a)](https://github.com/23Star/xianyu-super-butler/releases)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](https://react.dev/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-222222)](LICENSE)
