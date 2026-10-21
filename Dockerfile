@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-FROM node:20-alpine AS frontend-builder
+FROM node:24-alpine AS frontend-builder
 
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
@@ -29,7 +29,12 @@ ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --upgrade \
+        "certifi>=2026.10.19" \
+        "aiohttp>=3.14.4" \
+        "Pillow>=13.0.0" \
+        "protobuf>=5.29.6"
 
 COPY . .
 COPY --from=frontend-builder /frontend/dist ./static
@@ -53,9 +58,14 @@ RUN apt-get update && \
         libglib2.0-0 \
         xvfb \
         x11-utils \
-        nodejs \
-        npm && \
+        xz-utils && \
     rm -rf /var/lib/apt/lists/*
+
+# 2026-10 安全更新：用官方 Node 24.22.1 替换 Debian 自带的 EOL Node 18
+ARG NODE_VERSION=24.22.1
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz && \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 && \
+    rm -f /tmp/node.tar.xz && node -v && npm -v
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /app /app
