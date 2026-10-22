@@ -4222,6 +4222,40 @@ class PauseDurationUpdate(BaseModel):
     pause_duration: int
 
 
+class SelfKeywordTriggerUpdate(BaseModel):
+    enabled: bool
+
+
+@app.get("/cookies/{cid}/self-keyword-trigger")
+def get_self_keyword_trigger(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """读取当前账号的“自己发送也触发关键词”开关。"""
+    from app.db_manager import db_manager
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+    value = db_manager.get_system_setting(f"keyword_trigger_self_messages_{cid}")
+    return {"enabled": str(value or "").strip().lower() in ("1", "true", "yes", "on")}
+
+
+@app.put("/cookies/{cid}/self-keyword-trigger")
+def update_self_keyword_trigger(
+    cid: str,
+    update_data: SelfKeywordTriggerUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """账号所有者可以设置自己的“自己发送也触发关键词”开关。"""
+    from app.db_manager import db_manager
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+    db_manager.set_system_setting(
+        f"keyword_trigger_self_messages_{cid}",
+        "true" if update_data.enabled else "false",
+        "自己发送的消息也触发关键词回复",
+    )
+    return {"msg": "success", "enabled": update_data.enabled}
+
+
 @app.put("/cookies/{cid}/auto-confirm")
 def update_auto_confirm(cid: str, update_data: AutoConfirmUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号的自动确认发货设置"""

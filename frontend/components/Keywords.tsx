@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {AccountDetail, ShippingRule, DefaultReply} from '../types';
-import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords, getSystemSettings, updateSystemSettings } from '../services/api';
+import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords, getSelfKeywordTrigger, updateSelfKeywordTrigger } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
 import { confirmAction, notify } from '../services/feedback';
 import { EmptyState, PageHeader, PageLoading, PageTabs, SectionHeader } from './ui';
@@ -107,13 +107,8 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
 
   useEffect(() => {
     if (mode !== 'reply' || !selectedAccount) return;
-    getSystemSettings()
-      .then((settings) => {
-        const raw = (settings as any)[`keyword_trigger_self_messages_${selectedAccount}`];
-        setSelfTrigger(
-          ['1', 'true', 'yes', 'on'].includes(String(raw ?? 'false').toLowerCase()),
-        );
-      })
+    getSelfKeywordTrigger(selectedAccount)
+      .then((res) => setSelfTrigger(Boolean(res.enabled)))
       .catch(() => setSelfTrigger(false));
   }, [mode, selectedAccount]);
 
@@ -382,9 +377,7 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
     setSelfTrigger(next);
     setSelfTriggerSaving(true);
     try {
-      await updateSystemSettings({
-        [`keyword_trigger_self_messages_${selectedAccount}`]: next ? 'true' : 'false',
-      } as any);
+      await updateSelfKeywordTrigger(selectedAccount, next);
       notify(next ? '已开启：自己发送的消息也会触发关键词回复' : '已关闭自己发送触发');
     } catch (e) {
       setSelfTrigger(!next);

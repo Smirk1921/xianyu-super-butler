@@ -155,6 +155,14 @@ export const updateAccountPauseDuration = async (id: string, pauseDuration: numb
   return put(`/cookies/${id}/pause-duration`, { pause_duration: pauseDuration });
 };
 
+export const getSelfKeywordTrigger = async (id: string): Promise<{ enabled: boolean }> => {
+  return get(`/cookies/${id}/self-keyword-trigger`);
+};
+
+export const updateSelfKeywordTrigger = async (id: string, enabled: boolean): Promise<any> => {
+  return put(`/cookies/${id}/self-keyword-trigger`, { enabled });
+};
+
 export const updateAccountCookie = async (id: string, value: string): Promise<any> => {
   return put(`/cookies/${id}`, { id, value });
 };
