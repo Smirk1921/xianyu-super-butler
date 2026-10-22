@@ -7573,6 +7573,63 @@ class DBManager:
             logger.error(f"读取待补发订单失败: {e}")
             return []
 
+    def get_buyer_identity_by_chat_id(self, cookie_id: str, chat_id: str,
+                                      exclude_user_id: str = None):
+        """从订单或历史消息中找出会话对应的买家 (buyer_id, buyer_name)。
+
+        自己发出的消息里只有 chat_id，没有买家 ID；要在同一会话里给买家
+        回复关键词，需要先反查出对方。优先用订单的 buyer_id，其次用最近的
+        买家消息记录。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                chat_id = str(chat_id)
+                params = [cookie_id, chat_id]
+                sql = (
+                    "SELECT buyer_id FROM orders "
+                    "WHERE cookie_id = ? AND chat_id = ? "
+                    "AND buyer_id IS NOT NULL AND buyer_id != '' "
+                    "AND buyer_id != 'unknown_user'"
+                )
+                if exclude_user_id:
+                    sql += " AND buyer_id != ?"
+                    params.append(str(exclude_user_id))
+                sql += " ORDER BY created_at DESC LIMIT 1"
+                cursor.execute(sql, params)
+                row = cursor.fetchone()
+                if row and row[0]:
+                    buyer_id = str(row[0])
+                    cursor.execute(
+                        "SELECT sender_user_name FROM auto_reply_message_logs "
+                        "WHERE cookie_id = ? AND chat_id = ? AND sender_user_id = ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (cookie_id, chat_id, buyer_id),
+                    )
+                    name_row = cursor.fetchone()
+                    return buyer_id, str(name_row[0] or '') if name_row else ''
+
+                params2 = [cookie_id, chat_id]
+                sql2 = (
+                    "SELECT sender_user_id, sender_user_name "
+                    "FROM auto_reply_message_logs "
+                    "WHERE cookie_id = ? AND chat_id = ? "
+                    "AND sender_user_id IS NOT NULL AND sender_user_id != '' "
+                    "AND sender_user_id != 'unknown_user'"
+                )
+                if exclude_user_id:
+                    sql2 += " AND sender_user_id != ?"
+                    params2.append(str(exclude_user_id))
+                sql2 += " ORDER BY id DESC LIMIT 1"
+                cursor.execute(sql2, params2)
+                row2 = cursor.fetchone()
+                if row2 and row2[0]:
+                    return str(row2[0]), str(row2[1] or '')
+                return None, ''
+            except Exception as e:
+                logger.error(f"查询会话买家失败: {e}")
+                return None, ''
+
     def get_order_by_id(self, order_id: str):
         """根据订单ID获取订单信息"""
         with self.lock:

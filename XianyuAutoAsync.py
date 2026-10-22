@@ -937,6 +937,9 @@ class XianyuLive:
         self._delivery_reconcile_attempts = {}
         # 售出后即时上架检查的防抖：item_id -> 上次触发时间
         self._relist_check_scheduled = {}
+        # 自己发送消息触发关键词时，用于识别机器人回复回声和限制触发频率
+        self._recent_bot_replies = {}
+        self._self_keyword_last_trigger = {}
 
         # 交易卡片落库前暂存卖家端接口返回的真实成交数据（金额、数量、收货信息）
         self._pending_order_real_values = {}
@@ -10352,6 +10355,29 @@ class XianyuLive:
             self.message_debounce_tasks[chat_id]['task'] = task
             logger.warning(f"【{self.cookie_id}】为chat_id {chat_id} 创建防抖任务，延迟 {self.message_debounce_delay} 秒")
 
+    def _self_keyword_trigger_enabled(self) -> bool:
+        """是否允许自己发送的消息也触发关键词回复（按账号配置，默认关闭）。"""
+        try:
+            from app.db_manager import db_manager
+            value = db_manager.get_system_setting(
+                f"keyword_trigger_self_messages_{self.cookie_id}"
+            )
+            return str(value or '').strip().lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            return False
+
+    def _remember_bot_reply(self, chat_id: str, text: str) -> None:
+        """记录刚发出的回复，用于识别平台回显，避免自己触发自己。"""
+        text = (text or '').strip()
+        if not text:
+            return
+        now = time.time()
+        self._recent_bot_replies[(str(chat_id), text)] = now
+        if len(self._recent_bot_replies) > 200:
+            for key, timestamp in list(self._recent_bot_replies.items()):
+                if now - timestamp > 120:
+                    self._recent_bot_replies.pop(key, None)
+
     async def _try_keyword_reply_before_pause(
         self,
         message_data: dict,
@@ -10423,6 +10449,7 @@ class XianyuLive:
                 )
             else:
                 await self.send_msg(websocket, chat_id, send_user_id, reply)
+                self._remember_bot_reply(chat_id, reply)
                 self._update_reply_decision_log(
                     log_id, decision_reason="reply_sent", send_status="success"
                 )
@@ -11128,6 +11155,55 @@ class XianyuLive:
 
                 # 暂停该chat_id的自动回复10分钟
                 pause_manager.pause_chat(chat_id, self.cookie_id)
+
+                # 可选：自己发送的消息也触发关键词回复。默认关闭；开启后
+                # 需要先把买家反查出来，否则回复会发给自己而不是当前会话。
+                try:
+                    if self._self_keyword_trigger_enabled():
+                        from app.db_manager import db_manager
+                        buyer_id, buyer_name = db_manager.get_buyer_identity_by_chat_id(
+                            self.cookie_id, chat_id, exclude_user_id=self.myid
+                        )
+                        if buyer_id:
+                            now = time.time()
+                            recent_key = (str(chat_id), (send_message or '').strip())
+                            if (
+                                now - self._recent_bot_replies.get(recent_key, 0) < 15
+                                or now - self._self_keyword_last_trigger.get(str(chat_id), 0) < 3
+                            ):
+                                logger.info(
+                                    f"[{msg_time}] 【{self.cookie_id}】跳过机器人回复回声"
+                                    f"或自触发冷却"
+                                )
+                            else:
+                                self._self_keyword_last_trigger[str(chat_id)] = now
+                                await self._try_keyword_reply_before_pause(
+                                    message_data,
+                                    websocket,
+                                    buyer_name or send_user_name,
+                                    buyer_id,
+                                    send_message,
+                                    item_id,
+                                    chat_id,
+                                    msg_time,
+                                    {
+                                        "chat_id": chat_id,
+                                        "item_id": item_id,
+                                        "sender_user_id": buyer_id,
+                                        "sender_user_name": buyer_name or send_user_name,
+                                        "source_message": send_message,
+                                    },
+                                )
+                        else:
+                            logger.info(
+                                f"[{msg_time}] 【{self.cookie_id}】自己发送的消息已开启"
+                                f"关键词触发，但无法确定买家ID，跳过"
+                            )
+                except Exception as error:
+                    logger.error(
+                        f"[{msg_time}] 【{self.cookie_id}】自己发送消息触发关键词失败: "
+                        f"{self._safe_str(error)}"
+                    )
 
                 return
             else:

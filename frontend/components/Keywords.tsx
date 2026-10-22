@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {AccountDetail, ShippingRule, DefaultReply} from '../types';
-import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
+import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords, getSystemSettings, updateSystemSettings } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
 import { confirmAction, notify } from '../services/feedback';
 import { EmptyState, PageHeader, PageLoading, PageTabs, SectionHeader } from './ui';
@@ -77,6 +77,9 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
   });
 
   const [loading, setLoading] = useState(false);
+  // 自己发送的消息是否也触发关键词回复（按账号保存）
+  const [selfTrigger, setSelfTrigger] = useState(false);
+  const [selfTriggerSaving, setSelfTriggerSaving] = useState(false);
 
   useEffect(() => {
     if (mode === 'delivery') {
@@ -100,6 +103,18 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
       loadKeywords();
       loadDefaultReplies();
     }
+  }, [mode, selectedAccount]);
+
+  useEffect(() => {
+    if (mode !== 'reply' || !selectedAccount) return;
+    getSystemSettings()
+      .then((settings) => {
+        const raw = (settings as any)[`keyword_trigger_self_messages_${selectedAccount}`];
+        setSelfTrigger(
+          ['1', 'true', 'yes', 'on'].includes(String(raw ?? 'false').toLowerCase()),
+        );
+      })
+      .catch(() => setSelfTrigger(false));
   }, [mode, selectedAccount]);
 
   const loadDefaultReplies = async () => {
@@ -361,6 +376,24 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
     }
   };
 
+  const handleToggleSelfTrigger = async () => {
+    if (!selectedAccount || selfTriggerSaving) return;
+    const next = !selfTrigger;
+    setSelfTrigger(next);
+    setSelfTriggerSaving(true);
+    try {
+      await updateSystemSettings({
+        [`keyword_trigger_self_messages_${selectedAccount}`]: next ? 'true' : 'false',
+      } as any);
+      notify(next ? '已开启：自己发送的消息也会触发关键词回复' : '已关闭自己发送触发');
+    } catch (e) {
+      setSelfTrigger(!next);
+      notify('保存失败：' + (e as Error).message);
+    } finally {
+      setSelfTriggerSaving(false);
+    }
+  };
+
   const renderStatusSwitch = (enabled: boolean, onClick: () => void, label: string) => (
     <button
       type="button"
@@ -418,6 +451,16 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                   </option>
                 ))}
               </select>
+              {activeTab === 'reply' && selectedAccount && (
+                <div className="flex items-center gap-2 pl-1">
+                  {renderStatusSwitch(
+                    selfTrigger,
+                    handleToggleSelfTrigger,
+                    '自己发送的消息也触发关键词回复',
+                  )}
+                  <span className="text-xs font-bold text-gray-600">自己发送也触发</span>
+                </div>
+              )}
             </>
           ) : (
             <p className="text-sm text-gray-600">
