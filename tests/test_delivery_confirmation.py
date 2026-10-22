@@ -172,6 +172,19 @@ class DeliveryConfirmationDBTests(unittest.TestCase):
         record = self.manager.get_delivery_confirmation("acc", "o1")
         self.assertEqual(record["status"], "delivered")
 
+    def test_get_order_by_id_exposes_system_shipped(self):
+        self.manager.insert_or_update_order(
+            order_id="o-shipped",
+            item_id="item-1",
+            buyer_id="buyer-1",
+            cookie_id="acc",
+            order_status="shipped",
+            system_shipped=True,
+        )
+        order = self.manager.get_order_by_id("o-shipped")
+        self.assertTrue(order["system_shipped"])
+        self.assertEqual(order["order_status"], "shipped")
+
     def test_cancel_for_order(self):
         record = self._create_record()
         self.assertTrue(

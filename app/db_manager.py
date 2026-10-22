@@ -7806,7 +7806,8 @@ class DBManager:
                 # 先尝试查询包含version的订单
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id
+                       quantity, amount, order_status, cookie_id, is_bargain,
+                       created_at, updated_at, version, chat_id, system_shipped
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -7828,7 +7829,12 @@ class DBManager:
                         'created_at': row[10],
                         'updated_at': row[11],
                         'version': row[12] if len(row) > 12 else 1,  # 默认版本为1
-                        'chat_id': row[13] if len(row) > 13 else ''
+                        'chat_id': row[13] if len(row) > 13 else '',
+                        'system_shipped': (
+                            bool(row[14])
+                            if len(row) > 14 and row[14] is not None
+                            else False
+                        ),
                     }
                 return None
 
