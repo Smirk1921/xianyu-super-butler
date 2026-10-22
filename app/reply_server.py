@@ -587,34 +587,37 @@ async def login(request: LoginRequest):
                 captcha_required=True
             )
 
+        # 登录框只有一个输入框：用户可能填的是邮箱，按用户名查不到时回退到邮箱。
+        user = db_manager.get_user_by_username(request.username)
+        if not user and '@' in (request.username or '').strip():
+            user = db_manager.get_user_by_email(request.username.strip())
+
         # 统一使用用户表验证（包括admin用户）
-        if db_manager.verify_user_password(request.username, request.password):
-            user = db_manager.get_user_by_username(request.username)
-            if user:
-                login_failure_tracker.reset(fail_key)
-                # 生成token
-                token = generate_token()
-                SESSION_TOKENS[token] = {
-                    'user_id': user['id'],
-                    'username': user['username'],
-                    'is_admin': user.get('is_admin', False) or user['username'] == ADMIN_USERNAME,
-                    'timestamp': time.time()
-                }
+        if user and db_manager.verify_user_password(user['username'], request.password):
+            login_failure_tracker.reset(fail_key)
+            # 生成token
+            token = generate_token()
+            SESSION_TOKENS[token] = {
+                'user_id': user['id'],
+                'username': user['username'],
+                'is_admin': user.get('is_admin', False) or user['username'] == ADMIN_USERNAME,
+                'timestamp': time.time()
+            }
 
-                # 区分管理员和普通用户的日志
-                if user['username'] == ADMIN_USERNAME:
-                    logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
-                else:
-                    logger.info(f"【{user['username']}#{user['id']}】登录成功")
+            # 区分管理员和普通用户的日志
+            if user['username'] == ADMIN_USERNAME:
+                logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
+            else:
+                logger.info(f"【{user['username']}#{user['id']}】登录成功")
 
-                return LoginResponse(
-                    success=True,
-                    token=token,
-                    message="登录成功",
-                    user_id=user['id'],
-                    username=user['username'],
-                    is_admin=(user['username'] == ADMIN_USERNAME)
-                )
+            return LoginResponse(
+                success=True,
+                token=token,
+                message="登录成功",
+                user_id=user['id'],
+                username=user['username'],
+                is_admin=(user['username'] == ADMIN_USERNAME)
+            )
 
         login_failure_tracker.record_failure(fail_key)
         logger.warning(f"【{request.username}】登录失败：用户名或密码错误")

@@ -319,7 +319,7 @@ const App: React.FC = () => {
                     {authMode === 'login' ? '登录管理后台' : '注册新账号'}
                   </h2>
                   <p className="mt-2 text-sm text-gray-500">
-                    {authMode === 'login' ? '使用管理员账号进入工作台' : '创建账号后即可登录工作台'}
+                    {authMode === 'login' ? '使用账号或邮箱进入工作台' : '创建账号后即可登录工作台'}
                   </p>
                 </div>
 
@@ -327,12 +327,12 @@ const App: React.FC = () => {
                 <form onSubmit={handleLogin} className="space-y-5">
                   <div className="space-y-4">
                       <label className="block">
-                          <span className="mb-1.5 block text-xs font-bold text-gray-600">管理员账号</span>
+                          <span className="mb-1.5 block text-xs font-bold text-gray-600">账号或邮箱</span>
                           <div className="relative group">
                             <User className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400 group-focus-within:text-gray-700" />
                             <input
                                 type="text"
-                                placeholder="请输入账号"
+                                placeholder="请输入账号或邮箱"
                                 value={username}
                                 onChange={e => setUsername(e.target.value)}
                                 autoComplete="username"
