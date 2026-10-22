@@ -10352,6 +10352,97 @@ class XianyuLive:
             self.message_debounce_tasks[chat_id]['task'] = task
             logger.warning(f"【{self.cookie_id}】为chat_id {chat_id} 创建防抖任务，延迟 {self.message_debounce_delay} 秒")
 
+    async def _try_keyword_reply_before_pause(
+        self,
+        message_data: dict,
+        websocket,
+        send_user_name: str,
+        send_user_id: str,
+        send_message: str,
+        item_id: str,
+        chat_id: str,
+        msg_time: str,
+        log_context: dict,
+    ) -> bool:
+        """显式关键词优先匹配。
+
+        关键词是用户明确配置的规则，不应该被“人工接入暂停”挡住，也不应该
+        被商品专属回复/API 抢先。命中后立即发送并返回 True；没有命中返回
+        False，后续仍走原来的暂停、专属回复、API、AI、默认回复流程。
+        """
+        try:
+            reply = await self.get_keyword_reply(
+                send_user_name, send_user_id, send_message, item_id
+            )
+        except Exception as error:
+            logger.error(
+                f"【{self.cookie_id}】关键词优先匹配失败: {self._safe_str(error)}"
+            )
+            return False
+
+        if reply == "EMPTY_REPLY":
+            matched_keyword = self._find_reply_keyword(send_message, item_id)
+            self._add_reply_decision_log(
+                message_data,
+                **log_context,
+                process_status="skipped",
+                decision_reason="empty_reply",
+                reply_strategy="keyword",
+                matched_keyword=matched_keyword,
+                send_status="unknown",
+            )
+            logger.info(
+                f"[{msg_time}] 【{self.cookie_id}】关键词命中但回复为空，跳过自动回复"
+            )
+            return True
+
+        if not reply:
+            return False
+
+        matched_keyword = self._find_reply_keyword(send_message, item_id)
+        log_id = self._add_reply_decision_log(
+            message_data,
+            **log_context,
+            process_status="success",
+            decision_reason="reply_selected",
+            reply_strategy="keyword",
+            matched_keyword=matched_keyword,
+            reply_text=reply,
+            send_status="unknown",
+        )
+        try:
+            if reply.startswith("__IMAGE_SEND__"):
+                image_url = reply.replace("__IMAGE_SEND__", "")
+                await self.send_image_msg(websocket, chat_id, send_user_id, image_url)
+                self._update_reply_decision_log(
+                    log_id, decision_reason="reply_sent", send_status="success"
+                )
+                logger.info(
+                    f"[{msg_time}] 【关键词图片发出】用户: {send_user_name} "
+                    f"(ID: {send_user_id}), 商品({item_id}): 图片 {image_url}"
+                )
+            else:
+                await self.send_msg(websocket, chat_id, send_user_id, reply)
+                self._update_reply_decision_log(
+                    log_id, decision_reason="reply_sent", send_status="success"
+                )
+                logger.info(
+                    f"[{msg_time}] 【关键词发出】用户: {send_user_name} "
+                    f"(ID: {send_user_id}), 商品({item_id}): {reply}"
+                )
+        except Exception as error:
+            self._update_reply_decision_log(
+                log_id,
+                process_status="failed",
+                decision_reason="send_failed",
+                error_message=self._safe_str(error),
+                send_status="failed",
+            )
+            logger.error(
+                f"【{self.cookie_id}】关键词回复发送失败: {self._safe_str(error)}"
+            )
+        return True
+
     async def _process_chat_message_reply(self, message_data: dict, websocket, send_user_name: str,
                                          send_user_id: str, send_message: str, item_id: str,
                                          chat_id: str, msg_time: str):
@@ -10410,6 +10501,24 @@ class XianyuLive:
                 )
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】自动回复已禁用")
                 return
+
+            # 显式关键词优先：关键词是用户明确配置的规则，即使会话因人工
+            # 接入处于暂停状态，也先匹配并回复；没有命中再走原来的暂停和
+            # 专属回复/API/AI 流程。
+            keyword_handled = await self._try_keyword_reply_before_pause(
+                message_data,
+                websocket,
+                send_user_name,
+                send_user_id,
+                send_message,
+                item_id,
+                chat_id,
+                msg_time,
+                log_context,
+            )
+            if keyword_handled:
+                return
+            keyword_checked = True
 
             # 检查该chat_id是否处于暂停状态
             if pause_manager.is_chat_paused(chat_id, self.cookie_id):
@@ -10501,8 +10610,9 @@ class XianyuLive:
 
             # 如果以上都未命中，按关键词 -> AI -> 默认回复处理
             if not reply:
-                # 1. 首先尝试关键词匹配（传入商品ID）
-                reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
+                # 1. 关键词已在暂停判断前优先匹配过；这里只做兼容兜底
+                if not keyword_checked:
+                    reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
                 if reply == "EMPTY_REPLY":
                     # 匹配到关键词但回复内容为空，不进行任何回复
                     matched_keyword = self._find_reply_keyword(send_message, item_id)
