@@ -22,6 +22,7 @@ import {
   Card,
   Item,
   ItemDeliveryConfigSummary,
+  ItemDeliveryConfirmationSettings,
   ItemReply,
   ItemRelistSetting,
   ShippingRule,
@@ -35,12 +36,15 @@ import {
   getCards,
   getItemDeliveryConfig,
   getItemDeliveryConfigs,
+  getItemDeliveryConfirmation,
+  getItemDeliveryConfirmations,
   getItemReply,
   getItemReplies,
   getItemRelistSettings,
   getItems,
   getShippingRules,
   saveItemDeliveryConfig,
+  updateItemDeliveryConfirmation,
   polishItems,
   runItemRelist,
   syncItemsFromAccount,
@@ -72,6 +76,18 @@ interface DeliveryForm {
   enabled: boolean;
   isMultiSpec: boolean;
   variants: DeliveryVariantForm[];
+}
+
+interface ConfirmationForm {
+  useAccountDefault: boolean;
+  enabled: boolean;
+  confirmText: string;
+  confirmKeywords: string;
+  excludeKeywords: string;
+  timeoutMinutes: string;
+  reminderMinutes: string;
+  maxReminders: string;
+  reminderText: string;
 }
 
 interface ManualItemForm {
@@ -230,6 +246,25 @@ const ItemList: React.FC = () => {
   // 商品级自动重新上架配置：key 同上
   const [relistSettings, setRelistSettings] = useState<Record<string, ItemRelistSetting>>({});
 
+  // 商品级付款后确认发货配置：key 同上
+  const [confirmationSettings, setConfirmationSettings] = useState<
+    Record<string, ItemDeliveryConfirmationSettings>
+  >({});
+  const [confirmationItem, setConfirmationItem] = useState<Item | null>(null);
+  const [confirmationLoading, setConfirmationLoading] = useState(false);
+  const [confirmationSaving, setConfirmationSaving] = useState(false);
+  const [confirmationForm, setConfirmationForm] = useState<ConfirmationForm>({
+    useAccountDefault: true,
+    enabled: true,
+    confirmText: '',
+    confirmKeywords: '确认发货|确认',
+    excludeKeywords: '不确认|取消订单|申请退款',
+    timeoutMinutes: '30',
+    reminderMinutes: '10',
+    maxReminders: '2',
+    reminderText: '',
+  });
+
   const accountNames = useMemo(
     () => new Map(accounts.map(account => [
       account.id,
@@ -314,18 +349,27 @@ const ItemList: React.FC = () => {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [accountData, itemData, cardData, ruleData, configData] = await Promise.all([
+      const [accountData, itemData, cardData, ruleData, configData, confirmationData] = await Promise.all([
         getAccountDetails(),
         getItems(),
         getCards(),
         getShippingRules(),
         getItemDeliveryConfigs(),
+        getItemDeliveryConfirmations().catch(() => [] as ItemDeliveryConfirmationSettings[]),
       ]);
       setAccounts(accountData);
       setItems(itemData);
       setCards(cardData);
       setShippingRules(ruleData);
       setDeliveryConfigs(configData);
+
+      const confirmationMap: Record<string, ItemDeliveryConfirmationSettings> = {};
+      confirmationData.forEach(setting => {
+        if (setting.cookie_id && setting.item_id) {
+          confirmationMap[`${setting.cookie_id}:${setting.item_id}`] = setting;
+        }
+      });
+      setConfirmationSettings(confirmationMap);
 
       // 专属回复和自动上架配置都按账号拉取一次，供列表显示徽标和开关状态
       const cookieIds = Array.from(new Set(itemData.map(item => item.cookie_id)));
@@ -615,6 +659,85 @@ const ItemList: React.FC = () => {
       setNotice({ type: 'error', message: error instanceof Error ? error.message : '检查失败' });
     } finally {
       setSavingKey('');
+    }
+  };
+
+  const openConfirmation = async (item: Item) => {
+    setConfirmationItem(item);
+    setConfirmationLoading(true);
+    try {
+      const settings = await getItemDeliveryConfirmation(item.cookie_id, item.item_id);
+      const defaults = settings.account_defaults;
+      setConfirmationForm({
+        useAccountDefault: settings.use_account_default,
+        enabled: settings.use_account_default ? defaults.enabled : settings.enabled,
+        confirmText: settings.confirm_text ?? defaults.confirm_text,
+        confirmKeywords: settings.confirm_keywords ?? defaults.confirm_keywords,
+        excludeKeywords: settings.exclude_keywords ?? defaults.exclude_keywords,
+        timeoutMinutes: String(settings.timeout_minutes ?? defaults.timeout_minutes),
+        reminderMinutes: String(settings.reminder_minutes ?? defaults.reminder_minutes),
+        maxReminders: String(settings.max_reminders ?? defaults.max_reminders),
+        reminderText: settings.reminder_text ?? defaults.reminder_text,
+      });
+    } catch (error) {
+      setConfirmationItem(null);
+      setNotice({
+        type: 'error',
+        message: error instanceof Error ? error.message : '确认发货配置加载失败',
+      });
+    } finally {
+      setConfirmationLoading(false);
+    }
+  };
+
+  const refreshConfirmationSettings = async () => {
+    const settings = await getItemDeliveryConfirmations().catch(
+      () => [] as ItemDeliveryConfirmationSettings[],
+    );
+    const map: Record<string, ItemDeliveryConfirmationSettings> = {};
+    settings.forEach(setting => {
+      if (setting.cookie_id && setting.item_id) {
+        map[`${setting.cookie_id}:${setting.item_id}`] = setting;
+      }
+    });
+    setConfirmationSettings(map);
+  };
+
+  const handleSaveConfirmation = async () => {
+    if (!confirmationItem) return;
+    setConfirmationSaving(true);
+    try {
+      await updateItemDeliveryConfirmation(
+        confirmationItem.cookie_id,
+        confirmationItem.item_id,
+        {
+          use_account_default: confirmationForm.useAccountDefault,
+          enabled: confirmationForm.enabled,
+          confirm_text: confirmationForm.confirmText || null,
+          confirm_keywords: confirmationForm.confirmKeywords || null,
+          exclude_keywords: confirmationForm.excludeKeywords || null,
+          timeout_minutes: confirmationForm.timeoutMinutes === ''
+            ? null
+            : Number(confirmationForm.timeoutMinutes),
+          reminder_minutes: confirmationForm.reminderMinutes === ''
+            ? null
+            : Number(confirmationForm.reminderMinutes),
+          max_reminders: confirmationForm.maxReminders === ''
+            ? null
+            : Number(confirmationForm.maxReminders),
+          reminder_text: confirmationForm.reminderText || null,
+        },
+      );
+      await refreshConfirmationSettings();
+      setNotice({ type: 'success', message: '商品确认发货配置已保存' });
+      setConfirmationItem(null);
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error instanceof Error ? error.message : '保存确认发货配置失败',
+      });
+    } finally {
+      setConfirmationSaving(false);
     }
   };
 
@@ -1166,6 +1289,30 @@ const ItemList: React.FC = () => {
                           )}
                           <button
                             type="button"
+                            onClick={() => void openConfirmation(item)}
+                            disabled={busy}
+                            className={`relative rounded-md p-2 hover:bg-emerald-50 ${
+                              confirmationSettings[key]?.use_account_default === false
+                                && confirmationSettings[key]?.enabled !== false
+                                ? 'text-emerald-600'
+                                : 'text-gray-500'
+                            }`}
+                            title={
+                              confirmationSettings[key]?.use_account_default === false
+                                && confirmationSettings[key]?.enabled !== false
+                                ? '付款后确认发货（商品覆盖已启用）'
+                                : '付款后确认发货'
+                            }
+                            aria-label="付款后确认发货"
+                          >
+                            <PackageCheck className="h-4 w-4" />
+                            {confirmationSettings[key]?.use_account_default === false
+                              && confirmationSettings[key]?.enabled !== false && (
+                              <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                            )}
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => void openReply(item)}
                             disabled={busy}
                             className="rounded-md p-2 text-blue-600 hover:bg-blue-50"
@@ -1275,6 +1422,209 @@ const ItemList: React.FC = () => {
           onSelectedAccountChange={setSelectedAccount}
         />
       </section>
+
+      {confirmationItem && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container" style={{maxWidth: '640px'}}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900">
+                  <PackageCheck className="h-5 w-5 text-emerald-600" />
+                  付款后确认发货
+                </h3>
+                <p className="mt-1 line-clamp-1 text-sm text-gray-500">
+                  {confirmationItem.item_title || confirmationItem.item_id}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmationItem(null)}
+                className="rounded-md p-2 hover:bg-gray-100"
+                aria-label="关闭确认发货设置"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="modal-body space-y-5">
+              {confirmationLoading ? (
+                <div className="flex items-center justify-center gap-2 py-10 text-sm text-gray-500">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  加载配置中...
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between gap-4 rounded-md border border-gray-200 bg-gray-50 p-4">
+                    <div>
+                      <div className="font-bold text-gray-900">使用账号默认配置</div>
+                      <div className="text-xs text-gray-500">
+                        关闭后可为当前商品单独设置文案、关键词和超时
+                      </div>
+                    </div>
+                    <Toggle
+                      checked={confirmationForm.useAccountDefault}
+                      label="使用账号默认配置"
+                      onChange={() => setConfirmationForm(current => ({
+                        ...current,
+                        useAccountDefault: !current.useAccountDefault,
+                      }))}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-4 rounded-md border border-gray-200 bg-gray-50 p-4">
+                    <div>
+                      <div className="font-bold text-gray-900">启用付款后确认</div>
+                      <div className="text-xs text-gray-500">
+                        关闭后该商品付款即发，不再等待买家关键词
+                      </div>
+                    </div>
+                    <Toggle
+                      checked={confirmationForm.enabled}
+                      disabled={confirmationForm.useAccountDefault}
+                      label="启用付款后确认"
+                      onChange={() => setConfirmationForm(current => ({
+                        ...current,
+                        enabled: !current.enabled,
+                      }))}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-2 block text-sm font-bold text-gray-700">确认文案</label>
+                    <textarea
+                      value={confirmationForm.confirmText}
+                      onChange={(e) => setConfirmationForm(current => ({
+                        ...current,
+                        confirmText: e.target.value,
+                      }))}
+                      disabled={confirmationForm.useAccountDefault}
+                      className="ios-input h-32 w-full resize-y rounded-md px-3 py-2.5 disabled:cursor-not-allowed disabled:bg-gray-100"
+                    />
+                    <p className="mt-1 text-xs text-gray-500">
+                      支持 {'{buyer_name}'}、{'{item_title}'}、{'{order_id}'}、{'{keyword}'} 等占位符
+                    </p>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">确认关键词</label>
+                      <input
+                        type="text"
+                        value={confirmationForm.confirmKeywords}
+                        onChange={(e) => setConfirmationForm(current => ({
+                          ...current,
+                          confirmKeywords: e.target.value,
+                        }))}
+                        disabled={confirmationForm.useAccountDefault}
+                        className="ios-input w-full rounded-md px-3 py-2.5 disabled:cursor-not-allowed disabled:bg-gray-100"
+                      />
+                      <p className="mt-1 text-xs text-gray-500">用 | 分隔多个同义词</p>
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">排除词</label>
+                      <input
+                        type="text"
+                        value={confirmationForm.excludeKeywords}
+                        onChange={(e) => setConfirmationForm(current => ({
+                          ...current,
+                          excludeKeywords: e.target.value,
+                        }))}
+                        disabled={confirmationForm.useAccountDefault}
+                        className="ios-input w-full rounded-md px-3 py-2.5 disabled:cursor-not-allowed disabled:bg-gray-100"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-3">
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">超时（分钟）</label>
+                      <input
+                        type="number"
+                        value={confirmationForm.timeoutMinutes}
+                        onChange={(e) => setConfirmationForm(current => ({
+                          ...current,
+                          timeoutMinutes: e.target.value,
+                        }))}
+                        disabled={confirmationForm.useAccountDefault}
+                        min="5"
+                        max="1440"
+                        className="ios-input w-full rounded-md px-3 py-2.5 disabled:cursor-not-allowed disabled:bg-gray-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">提醒间隔</label>
+                      <input
+                        type="number"
+                        value={confirmationForm.reminderMinutes}
+                        onChange={(e) => setConfirmationForm(current => ({
+                          ...current,
+                          reminderMinutes: e.target.value,
+                        }))}
+                        disabled={confirmationForm.useAccountDefault}
+                        min="0"
+                        className="ios-input w-full rounded-md px-3 py-2.5 disabled:cursor-not-allowed disabled:bg-gray-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">最多提醒</label>
+                      <input
+                        type="number"
+                        value={confirmationForm.maxReminders}
+                        onChange={(e) => setConfirmationForm(current => ({
+                          ...current,
+                          maxReminders: e.target.value,
+                        }))}
+                        disabled={confirmationForm.useAccountDefault}
+                        min="0"
+                        max="10"
+                        className="ios-input w-full rounded-md px-3 py-2.5 disabled:cursor-not-allowed disabled:bg-gray-100"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="mb-2 block text-sm font-bold text-gray-700">提醒文案</label>
+                    <textarea
+                      value={confirmationForm.reminderText}
+                      onChange={(e) => setConfirmationForm(current => ({
+                        ...current,
+                        reminderText: e.target.value,
+                      }))}
+                      disabled={confirmationForm.useAccountDefault}
+                      placeholder="留空使用默认提醒文案"
+                      className="ios-input h-20 w-full resize-y rounded-md px-3 py-2.5 disabled:cursor-not-allowed disabled:bg-gray-100"
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="modal-footer">
+              <div className="flex w-full gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmationItem(null)}
+                  className="ios-btn-secondary flex-1 rounded-md px-4 py-2.5 text-sm"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSaveConfirmation()}
+                  disabled={confirmationSaving || confirmationLoading}
+                  className="ios-btn-primary flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm"
+                >
+                  {confirmationSaving
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : <Save className="h-4 w-4" />}
+                  {confirmationSaving ? '保存中...' : '保存'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
 
       {deliveryItem && createPortal(
         <div className="modal-overlay">

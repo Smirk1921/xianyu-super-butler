@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AccountDetail, AIReplySettings } from '../types';
+import { AccountDetail, AIReplySettings, DeliveryConfirmationSettings } from '../types';
 import {
   getAccountDetails,
   updateAccountStatus,
@@ -15,6 +15,8 @@ import {
   updateAccountAISettings,
   getAllAISettings,
   getAccountAISettings,
+  getDeliveryConfirmationSettings,
+  updateDeliveryConfirmationSettings,
   refreshAccountProfile,
   getRiskControlStatus,
   startManualCaptchaSession,
@@ -24,7 +26,18 @@ import { confirmAction, notify } from '../services/feedback';
 import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
 import { EmptyState, PageHeader, PageLoading } from './ui';
 
-type ModalType = 'edit' | 'ai-settings' | null;
+type ModalType = 'edit' | 'ai-settings' | 'delivery-confirmation' | null;
+
+const EMPTY_DELIVERY_CONFIRMATION: DeliveryConfirmationSettings = {
+  enabled: false,
+  confirm_text: '',
+  confirm_keywords: '确认发货|确认',
+  exclude_keywords: '不确认|取消订单|申请退款|不买了|不要了',
+  timeout_minutes: 30,
+  reminder_minutes: 10,
+  max_reminders: 2,
+  reminder_text: '',
+};
 
 const AccountList: React.FC = () => {
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
@@ -92,6 +105,10 @@ const AccountList: React.FC = () => {
     context_expire_minutes: 120,
     custom_prompts: '',
   });
+  const [deliveryConfirmation, setDeliveryConfirmation] = useState<DeliveryConfirmationSettings>(
+    EMPTY_DELIVERY_CONFIRMATION,
+  );
+  const [deliveryConfirmationLoading, setDeliveryConfirmationLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const loadAccounts = async (options?: { silent?: boolean }) => {
@@ -458,6 +475,38 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const openDeliveryConfirmationModal = async (account: AccountDetail) => {
+    setEditingAccount(account);
+    setActiveModal('delivery-confirmation');
+    setDeliveryConfirmationLoading(true);
+    try {
+      const settings = await getDeliveryConfirmationSettings(account.id);
+      setDeliveryConfirmation({ ...EMPTY_DELIVERY_CONFIRMATION, ...settings });
+    } catch (error) {
+      console.error('加载确认发货配置失败:', error);
+      notify('加载确认发货配置失败，请重试');
+      setDeliveryConfirmation(EMPTY_DELIVERY_CONFIRMATION);
+    } finally {
+      setDeliveryConfirmationLoading(false);
+    }
+  };
+
+  const handleSaveDeliveryConfirmation = async () => {
+    if (!editingAccount) return;
+    setSaving(true);
+    try {
+      const { configured: _configured, ...payload } = deliveryConfirmation;
+      await updateDeliveryConfirmationSettings(editingAccount.id, payload);
+      notify('确认发货配置已保存');
+      setActiveModal(null);
+    } catch (error) {
+      console.error('保存确认发货配置失败:', error);
+      notify('保存失败，请检查配置后重试');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const startQRLogin = async () => {
     qrSessionRef.current = '';
     if (qrPollTimerRef.current) clearTimeout(qrPollTimerRef.current);
@@ -770,6 +819,13 @@ const AccountList: React.FC = () => {
                     <Bot className="w-5 h-5" />
                 </button>
                 <button
+                    onClick={() => openDeliveryConfirmationModal(account)}
+                    className="rounded-md p-2.5 text-emerald-700 hover:bg-emerald-50"
+                    title="付款后确认发货"
+                >
+                    <MessageSquare className="w-5 h-5" />
+                </button>
+                <button
                     onClick={() => handleToggle(account.id, account.enabled)}
                     className={`rounded-md p-2.5 ${account.enabled ? 'text-green-600 hover:bg-green-50' : 'text-gray-400 hover:bg-gray-100'}`}
                     title={account.enabled ? '暂停账号' : '启用账号'}
@@ -1061,6 +1117,224 @@ const AccountList: React.FC = () => {
                   onClick={handleSaveEdit}
                   className="ios-btn-primary flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm"
                   disabled={saving}
+                >
+                  {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  {saving ? '保存中...' : '保存'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* 付款后确认发货弹窗 */}
+      {activeModal === 'delivery-confirmation' && editingAccount && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container" style={{maxWidth: '640px'}}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900">
+                  <MessageSquare className="h-5 w-5 text-emerald-600" />
+                  付款后确认发货
+                </h3>
+                <p className="mt-1 text-xs text-gray-500">
+                  {editingAccount.nickname || editingAccount.remark || editingAccount.id}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveModal(null)}
+                className="shrink-0 rounded-md p-2 hover:bg-gray-100"
+                aria-label="关闭确认发货设置"
+              >
+                <X className="w-5 h-5 text-gray-500" />
+              </button>
+            </div>
+
+            <div className="modal-body space-y-5">
+              {deliveryConfirmationLoading ? (
+                <div className="flex items-center justify-center gap-2 py-10 text-sm text-gray-500">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  加载配置中...
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between gap-4 rounded-md border border-gray-200 bg-gray-50 p-4">
+                    <div>
+                      <div className="flex items-center gap-2 font-bold text-gray-900">
+                        <MessageSquare className="h-4 w-4 text-emerald-600" />
+                        启用付款后确认
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        买家付款后先收到确认文案，回复关键词后才扣库存并发货
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setDeliveryConfirmation({
+                        ...deliveryConfirmation,
+                        enabled: !deliveryConfirmation.enabled,
+                      })}
+                      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
+                        deliveryConfirmation.enabled ? 'bg-[#ffe100]' : 'bg-gray-300'
+                      }`}
+                      aria-label="启用付款后确认"
+                    >
+                      <span
+                        className={`absolute left-1 top-1 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+                          deliveryConfirmation.enabled ? 'translate-x-5' : ''
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <div>
+                    <label className="mb-2 block text-sm font-bold text-gray-700">
+                      确认文案
+                    </label>
+                    <textarea
+                      value={deliveryConfirmation.confirm_text}
+                      onChange={(e) => setDeliveryConfirmation({
+                        ...deliveryConfirmation,
+                        confirm_text: e.target.value,
+                      })}
+                      placeholder={'亲，您拍下的商品需要确认后发货。\n确认无误请回复「{keyword}」，我们会立即为您发送卡密。'}
+                      className="ios-input h-36 w-full resize-y rounded-md px-3 py-2.5"
+                    />
+                    <p className="mt-1 text-xs text-gray-500">
+                      可用占位符：{'{buyer_name}'}、{'{item_title}'}、{'{item_id}'}、{'{order_id}'}、{'{keyword}'}、{'{keywords}'}。
+                      文案里没有提示关键词时，系统会自动追加回复提示。
+                    </p>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">
+                        确认关键词
+                      </label>
+                      <input
+                        type="text"
+                        value={deliveryConfirmation.confirm_keywords}
+                        onChange={(e) => setDeliveryConfirmation({
+                          ...deliveryConfirmation,
+                          confirm_keywords: e.target.value,
+                        })}
+                        placeholder="确认发货|确认|要的"
+                        className="ios-input w-full rounded-md px-3 py-2.5"
+                      />
+                      <p className="mt-1 text-xs text-gray-500">用 | 分隔多个同义词，包含即命中</p>
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">
+                        排除词（可选）
+                      </label>
+                      <input
+                        type="text"
+                        value={deliveryConfirmation.exclude_keywords}
+                        onChange={(e) => setDeliveryConfirmation({
+                          ...deliveryConfirmation,
+                          exclude_keywords: e.target.value,
+                        })}
+                        placeholder="不确认|取消订单|申请退款"
+                        className="ios-input w-full rounded-md px-3 py-2.5"
+                      />
+                      <p className="mt-1 text-xs text-gray-500">买家消息含排除词时不会触发发货</p>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-3">
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">
+                        超时（分钟）
+                      </label>
+                      <input
+                        type="number"
+                        value={deliveryConfirmation.timeout_minutes}
+                        onChange={(e) => setDeliveryConfirmation({
+                          ...deliveryConfirmation,
+                          timeout_minutes: parseInt(e.target.value) || 0,
+                        })}
+                        min="5"
+                        max="1440"
+                        className="ios-input w-full rounded-md px-3 py-2.5"
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">
+                        提醒间隔（分钟）
+                      </label>
+                      <input
+                        type="number"
+                        value={deliveryConfirmation.reminder_minutes}
+                        onChange={(e) => setDeliveryConfirmation({
+                          ...deliveryConfirmation,
+                          reminder_minutes: parseInt(e.target.value) || 0,
+                        })}
+                        min="0"
+                        max="1439"
+                        className="ios-input w-full rounded-md px-3 py-2.5"
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-bold text-gray-700">
+                        最多提醒次数
+                      </label>
+                      <input
+                        type="number"
+                        value={deliveryConfirmation.max_reminders}
+                        onChange={(e) => setDeliveryConfirmation({
+                          ...deliveryConfirmation,
+                          max_reminders: parseInt(e.target.value) || 0,
+                        })}
+                        min="0"
+                        max="10"
+                        className="ios-input w-full rounded-md px-3 py-2.5"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="mb-2 block text-sm font-bold text-gray-700">
+                      提醒文案（可选）
+                    </label>
+                    <textarea
+                      value={deliveryConfirmation.reminder_text}
+                      onChange={(e) => setDeliveryConfirmation({
+                        ...deliveryConfirmation,
+                        reminder_text: e.target.value,
+                      })}
+                      placeholder="留空使用默认提醒文案"
+                      className="ios-input h-24 w-full resize-y rounded-md px-3 py-2.5"
+                    />
+                  </div>
+
+                  <div className="rounded-md border border-blue-200 bg-blue-50 p-4 text-xs leading-relaxed text-blue-800">
+                    <p className="font-bold">超时后不会自动发货</p>
+                    <p className="mt-1">
+                      买家在超时前没有回复关键词时，订单会保持待发货并通知卖家人工处理。
+                      商品级可以在商品列表里单独覆盖本账号配置。
+                    </p>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="modal-footer">
+              <div className="flex w-full gap-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveModal(null)}
+                  className="ios-btn-secondary flex-1 rounded-md px-4 py-2.5 text-sm"
+                  disabled={saving}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSaveDeliveryConfirmation}
+                  className="ios-btn-primary flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm"
+                  disabled={saving || deliveryConfirmationLoading}
                 >
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                   {saving ? '保存中...' : '保存'}

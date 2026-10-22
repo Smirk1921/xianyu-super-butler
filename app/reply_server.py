@@ -21,6 +21,19 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 from app import cookie_manager
 from app.db_manager import db_manager
 from app.delivery_template import send_payload as send_delivery_payload
+from app.delivery_confirmation import (
+    DEFAULT_CONFIRM_KEYWORDS,
+    DEFAULT_CONFIRM_TEXT,
+    DEFAULT_EXCLUDE_KEYWORDS,
+    DEFAULT_MAX_REMINDERS,
+    DEFAULT_REMINDER_MINUTES,
+    DEFAULT_REMINDER_TEXT,
+    DEFAULT_TIMEOUT_MINUTES,
+    normalize_max_reminders,
+    normalize_reminder_minutes,
+    normalize_timeout_minutes,
+    parse_keyword_list,
+)
 from app.product_automation import ProductAutomationService
 from app.item_relist import ItemRelistService
 from app.file_log_collector import setup_file_logging, get_file_log_collector
@@ -3940,7 +3953,9 @@ def list_auto_reply_logs(
     send_status = (send_status or "").strip() or None
     if process_status not in (None, "success", "skipped", "failed"):
         raise HTTPException(status_code=400, detail="无效的处理状态")
-    if reply_strategy not in (None, "keyword", "ai", "default", "api", "none"):
+    if reply_strategy not in (
+        None, "keyword", "ai", "default", "api", "none", "delivery_confirm"
+    ):
         raise HTTPException(status_code=400, detail="无效的回复策略")
     if send_status not in (None, "success", "failed", "unknown"):
         raise HTTPException(status_code=400, detail="无效的发送状态")
@@ -4429,6 +4444,423 @@ def get_cookie_pause_duration(cid: str, current_user: Dict[str, Any] = Depends(g
             "pause_duration": pause_duration,
             "message": "获取暂停时间成功"
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class DeliveryConfirmationSettingsIn(BaseModel):
+    enabled: bool = False
+    confirm_text: str = ""
+    confirm_keywords: str = DEFAULT_CONFIRM_KEYWORDS
+    exclude_keywords: str = DEFAULT_EXCLUDE_KEYWORDS
+    timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES
+    reminder_minutes: int = DEFAULT_REMINDER_MINUTES
+    max_reminders: int = DEFAULT_MAX_REMINDERS
+    reminder_text: str = ""
+
+
+class ItemDeliveryConfirmationSettingsIn(BaseModel):
+    use_account_default: bool = True
+    enabled: bool = True
+    confirm_text: Optional[str] = None
+    confirm_keywords: Optional[str] = None
+    exclude_keywords: Optional[str] = None
+    timeout_minutes: Optional[int] = None
+    reminder_minutes: Optional[int] = None
+    max_reminders: Optional[int] = None
+    reminder_text: Optional[str] = None
+
+
+def _validate_delivery_confirmation_fields(
+    enabled: bool,
+    confirm_text: str,
+    confirm_keywords: str,
+    timeout_minutes: int,
+    reminder_minutes: int,
+    max_reminders: int,
+) -> Dict[str, Any]:
+    """校验并规范化账号/商品确认发货字段。"""
+    if len(str(confirm_text or "")) > 2000:
+        raise HTTPException(status_code=400, detail="确认文案不能超过 2000 字")
+    try:
+        timeout_value = int(timeout_minutes)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="超时时间必须是整数")
+    if timeout_value < 5 or timeout_value > 1440:
+        raise HTTPException(status_code=400, detail="超时时间必须在 5-1440 分钟之间")
+    try:
+        reminder_value = int(reminder_minutes)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="提醒间隔必须是整数")
+    if reminder_value < 0 or reminder_value >= timeout_value:
+        raise HTTPException(status_code=400, detail="提醒间隔必须小于超时时间，且不能为负数")
+    try:
+        max_count = int(max_reminders)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="最大提醒次数必须是整数")
+    if max_count < 0 or max_count > 10:
+        raise HTTPException(status_code=400, detail="最大提醒次数必须在 0-10 之间")
+
+    keywords = parse_keyword_list(confirm_keywords)
+    if enabled and not keywords:
+        raise HTTPException(status_code=400, detail="启用确认发货时至少需要一个关键词")
+
+    return {
+        "enabled": bool(enabled),
+        "confirm_text": str(confirm_text or ""),
+        "confirm_keywords": "|".join(keywords),
+        "timeout_minutes": normalize_timeout_minutes(timeout_value),
+        "reminder_minutes": normalize_reminder_minutes(reminder_value, timeout_value),
+        "max_reminders": normalize_max_reminders(max_count),
+    }
+
+
+@app.get("/cookies/{cid}/delivery-confirmation")
+def get_delivery_confirmation_settings(
+    cid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """获取账号级付款后确认发货配置。"""
+    try:
+        user_id = current_user["user_id"]
+        if cid not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        settings = db_manager.get_delivery_confirmation_settings(cid) or {}
+        return {
+            "configured": bool(settings),
+            "enabled": bool(settings.get("enabled")),
+            "confirm_text": settings.get("confirm_text") or DEFAULT_CONFIRM_TEXT,
+            "confirm_keywords": settings.get("confirm_keywords") or DEFAULT_CONFIRM_KEYWORDS,
+            "exclude_keywords": (
+                settings.get("exclude_keywords")
+                if settings.get("exclude_keywords") is not None
+                else DEFAULT_EXCLUDE_KEYWORDS
+            ),
+            "timeout_minutes": int(settings.get("timeout_minutes") or DEFAULT_TIMEOUT_MINUTES),
+            "reminder_minutes": int(
+                settings.get("reminder_minutes")
+                if settings.get("reminder_minutes") is not None
+                else DEFAULT_REMINDER_MINUTES
+            ),
+            "max_reminders": int(
+                settings.get("max_reminders")
+                if settings.get("max_reminders") is not None
+                else DEFAULT_MAX_REMINDERS
+            ),
+            "reminder_text": settings.get("reminder_text") or DEFAULT_REMINDER_TEXT,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/cookies/{cid}/delivery-confirmation")
+def update_delivery_confirmation_settings(
+    cid: str,
+    payload: DeliveryConfirmationSettingsIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """保存账号级付款后确认发货配置。"""
+    try:
+        user_id = current_user["user_id"]
+        if cid not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        normalized = _validate_delivery_confirmation_fields(
+            payload.enabled,
+            payload.confirm_text,
+            payload.confirm_keywords,
+            payload.timeout_minutes,
+            payload.reminder_minutes,
+            payload.max_reminders,
+        )
+        success = db_manager.save_delivery_confirmation_settings(
+            user_id=user_id,
+            cookie_id=cid,
+            enabled=normalized["enabled"],
+            confirm_text=normalized["confirm_text"],
+            confirm_keywords=normalized["confirm_keywords"],
+            exclude_keywords=payload.exclude_keywords or "",
+            timeout_minutes=normalized["timeout_minutes"],
+            reminder_minutes=normalized["reminder_minutes"],
+            max_reminders=normalized["max_reminders"],
+            reminder_text=payload.reminder_text or "",
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="保存确认发货配置失败")
+        log_with_user(
+            "info",
+            f"更新账号确认发货配置: {cid}, enabled={normalized['enabled']}",
+            current_user,
+        )
+        return {"message": "保存成功", **normalized}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _item_confirmation_account_defaults(cid: str) -> Dict[str, Any]:
+    settings = db_manager.get_delivery_confirmation_settings(cid) or {}
+    return {
+        "enabled": bool(settings.get("enabled")),
+        "confirm_text": settings.get("confirm_text") or DEFAULT_CONFIRM_TEXT,
+        "confirm_keywords": settings.get("confirm_keywords") or DEFAULT_CONFIRM_KEYWORDS,
+        "exclude_keywords": (
+            settings.get("exclude_keywords")
+            if settings.get("exclude_keywords") is not None
+            else DEFAULT_EXCLUDE_KEYWORDS
+        ),
+        "timeout_minutes": int(settings.get("timeout_minutes") or DEFAULT_TIMEOUT_MINUTES),
+        "reminder_minutes": int(
+            settings.get("reminder_minutes")
+            if settings.get("reminder_minutes") is not None
+            else DEFAULT_REMINDER_MINUTES
+        ),
+        "max_reminders": int(
+            settings.get("max_reminders")
+            if settings.get("max_reminders") is not None
+            else DEFAULT_MAX_REMINDERS
+        ),
+        "reminder_text": settings.get("reminder_text") or DEFAULT_REMINDER_TEXT,
+    }
+
+
+@app.get("/items/{cookie_id}/{item_id}/delivery-confirmation")
+def get_item_delivery_confirmation(
+    cookie_id: str,
+    item_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """获取商品级确认发货覆盖配置和账号默认值。"""
+    try:
+        user_id = current_user["user_id"]
+        if cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        if not db_manager.get_item_info(cookie_id, item_id):
+            raise HTTPException(status_code=404, detail="商品不存在")
+        override = db_manager.get_item_delivery_confirmation_setting(cookie_id, item_id) or {}
+        return {
+            "use_account_default": bool(override.get("use_account_default", 1)),
+            "enabled": bool(override.get("enabled", 1)),
+            "confirm_text": override.get("confirm_text"),
+            "confirm_keywords": override.get("confirm_keywords"),
+            "exclude_keywords": override.get("exclude_keywords"),
+            "timeout_minutes": override.get("timeout_minutes"),
+            "reminder_minutes": override.get("reminder_minutes"),
+            "max_reminders": override.get("max_reminders"),
+            "reminder_text": override.get("reminder_text"),
+            "account_defaults": _item_confirmation_account_defaults(cookie_id),
+            "effective": db_manager.get_effective_delivery_confirmation(cookie_id, item_id),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/items/{cookie_id}/{item_id}/delivery-confirmation")
+def update_item_delivery_confirmation(
+    cookie_id: str,
+    item_id: str,
+    payload: ItemDeliveryConfirmationSettingsIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """保存商品级确认发货覆盖配置。"""
+    try:
+        user_id = current_user["user_id"]
+        if cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        if not db_manager.get_item_info(cookie_id, item_id):
+            raise HTTPException(status_code=404, detail="商品不存在")
+
+        timeout_value = payload.timeout_minutes
+        reminder_value = payload.reminder_minutes
+        max_count = payload.max_reminders
+        if not payload.use_account_default:
+            defaults = _item_confirmation_account_defaults(cookie_id)
+            if timeout_value is None:
+                timeout_value = defaults["timeout_minutes"]
+            if reminder_value is None:
+                reminder_value = defaults["reminder_minutes"]
+            if max_count is None:
+                max_count = defaults["max_reminders"]
+            normalized = _validate_delivery_confirmation_fields(
+                payload.enabled,
+                payload.confirm_text if payload.confirm_text is not None else defaults["confirm_text"],
+                payload.confirm_keywords
+                if payload.confirm_keywords is not None
+                else defaults["confirm_keywords"],
+                timeout_value,
+                reminder_value,
+                max_count,
+            )
+            # 只保存用户明确填写的值；空值继续继承账号配置
+            save_timeout = payload.timeout_minutes
+            save_reminder = payload.reminder_minutes
+            save_max = payload.max_reminders
+        else:
+            save_timeout = payload.timeout_minutes
+            save_reminder = payload.reminder_minutes
+            save_max = payload.max_reminders
+
+        success = db_manager.save_item_delivery_confirmation_setting(
+            user_id=user_id,
+            cookie_id=cookie_id,
+            item_id=item_id,
+            use_account_default=payload.use_account_default,
+            enabled=payload.enabled,
+            confirm_text=payload.confirm_text,
+            confirm_keywords=payload.confirm_keywords,
+            exclude_keywords=payload.exclude_keywords,
+            timeout_minutes=save_timeout,
+            reminder_minutes=save_reminder,
+            max_reminders=save_max,
+            reminder_text=payload.reminder_text,
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="保存商品确认发货配置失败")
+        log_with_user(
+            "info",
+            f"更新商品确认发货配置: {cookie_id}/{item_id}, "
+            f"use_account_default={payload.use_account_default}",
+            current_user,
+        )
+        return {
+            "message": "保存成功",
+            "effective": db_manager.get_effective_delivery_confirmation(cookie_id, item_id),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/item-delivery-confirmations")
+def list_item_delivery_confirmations(
+    cookie_id: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """列出商品级确认发货配置，供商品列表显示徽标。"""
+    try:
+        user_id = current_user["user_id"]
+        if cookie_id and cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        items = db_manager.list_item_delivery_confirmation_settings(
+            user_id, cookie_id
+        )
+        return {"items": items}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/delivery-confirmations")
+def list_delivery_confirmations(
+    status: str = Query("active", description="active/all/具体状态，逗号分隔"),
+    cookie_id: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=1000),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """列出付款后确认发货记录。"""
+    try:
+        user_id = current_user["user_id"]
+        is_admin = current_user.get("username") == ADMIN_USERNAME
+        if cookie_id:
+            if is_admin:
+                if not db_manager.get_cookie_by_id(cookie_id):
+                    raise HTTPException(status_code=404, detail="账号不存在")
+            elif cookie_id not in db_manager.get_all_cookies(user_id):
+                raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        allowed_statuses = {
+            "pending", "prompt_sent", "prompt_failed", "confirmed",
+            "delivered", "expired", "cancelled", "delivery_failed",
+        }
+        status_value = str(status or "active").strip()
+        if status_value == "all":
+            statuses = None
+        elif status_value == "active":
+            statuses = ["pending", "prompt_sent", "prompt_failed", "confirmed"]
+        else:
+            statuses = [item.strip() for item in status_value.split(",") if item.strip()]
+            invalid = [item for item in statuses if item not in allowed_statuses]
+            if invalid:
+                raise HTTPException(status_code=400, detail=f"无效状态: {','.join(invalid)}")
+            if not statuses:
+                statuses = None
+
+        items = db_manager.list_delivery_confirmations(
+            user_id=None if is_admin else user_id,
+            cookie_id=cookie_id,
+            statuses=statuses,
+            limit=limit,
+        )
+        return {"items": items, "total": len(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/delivery-confirmations/{record_id}/resend")
+async def resend_delivery_confirmation(
+    record_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动重发确认文案。"""
+    try:
+        from XianyuAutoAsync import XianyuLive
+
+        is_admin = current_user.get("username") == ADMIN_USERNAME
+        record = db_manager.get_delivery_confirmation_by_id(
+            record_id, None if is_admin else current_user["user_id"]
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="确认记录不存在")
+        live_instance = XianyuLive.get_instance(record["cookie_id"])
+        if not live_instance:
+            raise HTTPException(status_code=409, detail="该账号未在线运行，无法重发")
+        success, message = await live_instance.resend_delivery_confirmation(
+            record_id, None if is_admin else current_user["user_id"]
+        )
+        log_with_user(
+            "info",
+            f"重发确认文案: record_id={record_id}, success={success}, message={message}",
+            current_user,
+        )
+        return {"success": success, "message": message}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/delivery-confirmations/{record_id}/cancel")
+def cancel_delivery_confirmation(
+    record_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """取消等待，不自动发货；订单仍保持待发货状态。"""
+    try:
+        is_admin = current_user.get("username") == ADMIN_USERNAME
+        record = db_manager.get_delivery_confirmation_by_id(
+            record_id, None if is_admin else current_user["user_id"]
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="确认记录不存在")
+        success = db_manager.mark_delivery_confirmation_status(
+            record_id, "cancelled", "manual_cancel"
+        )
+        if not success:
+            raise HTTPException(status_code=400, detail="当前状态不可取消")
+        log_with_user(
+            "info", f"取消确认发货记录: record_id={record_id}", current_user
+        )
+        return {"success": True, "message": "已取消确认等待"}
     except HTTPException:
         raise
     except Exception as e:
@@ -8049,7 +8481,8 @@ def get_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', "item_replay",
-            'risk_control_logs'
+            'risk_control_logs', 'delivery_confirmation_settings',
+            'item_delivery_confirmation_settings', 'delivery_confirmations'
         ]
 
         if table_name not in allowed_tables:
@@ -8086,7 +8519,9 @@ def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, A
             'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
-            'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders','item_replay'
+            'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders','item_replay',
+            'delivery_confirmation_settings', 'item_delivery_confirmation_settings',
+            'delivery_confirmations'
         ]
 
         if table_name not in allowed_tables:
@@ -8127,7 +8562,8 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
             'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', 'item_replay',
-            'risk_control_logs'
+            'risk_control_logs', 'delivery_confirmation_settings',
+            'item_delivery_confirmation_settings', 'delivery_confirmations'
         ]
 
         # 不允许清空用户表
@@ -8977,6 +9413,9 @@ async def manual_ship_orders(
                                 order_status='shipped',
                                 system_shipped=True
                             )
+                            db_manager.cancel_delivery_confirmations_for_order(
+                                order_id, "manual_status_ship"
+                            )
                             results.append({
                                 'order_id': order_id,
                                 'success': True,
@@ -9052,6 +9491,11 @@ async def manual_ship_orders(
                         })
                         failed_count += 1
                         continue
+
+                    # 卖家手动完整发货时关闭待确认记录，避免买家随后回复关键词二次发卡。
+                    db_manager.cancel_delivery_confirmations_for_order(
+                        order_id, "manual_full_delivery"
+                    )
 
                     protection_result = await live_instance.apply_delivery_block_rules(
                         order_id=order_id,

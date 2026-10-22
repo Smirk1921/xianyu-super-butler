@@ -209,6 +209,68 @@ export interface ItemDeliveryConfig extends ItemDeliveryConfigSummary {
   variants: ProductVariantBinding[];
 }
 
+export interface DeliveryConfirmationSettings {
+  configured?: boolean;
+  enabled: boolean;
+  confirm_text: string;
+  confirm_keywords: string;
+  exclude_keywords: string;
+  timeout_minutes: number;
+  reminder_minutes: number;
+  max_reminders: number;
+  reminder_text: string;
+}
+
+export interface ItemDeliveryConfirmationSettings {
+  cookie_id?: string;
+  item_id?: string;
+  item_title?: string;
+  use_account_default: boolean;
+  enabled: boolean;
+  confirm_text?: string | null;
+  confirm_keywords?: string | null;
+  exclude_keywords?: string | null;
+  timeout_minutes?: number | null;
+  reminder_minutes?: number | null;
+  max_reminders?: number | null;
+  reminder_text?: string | null;
+  account_defaults: DeliveryConfirmationSettings;
+  effective: DeliveryConfirmationSettings;
+}
+
+export interface DeliveryConfirmationRecord {
+  id: number;
+  user_id: number;
+  cookie_id: string;
+  order_id: string;
+  item_id?: string;
+  buyer_id?: string;
+  buyer_name?: string;
+  chat_id?: string;
+  status: 'pending' | 'prompt_sent' | 'prompt_failed' | 'confirmed' | 'delivered' | 'expired' | 'cancelled' | 'delivery_failed' | string;
+  prompt_text?: string;
+  keywords?: string;
+  exclude_keywords?: string;
+  timeout_minutes?: number;
+  reminder_text?: string;
+  reminder_minutes?: number;
+  max_reminders?: number;
+  prompt_attempts?: number;
+  prompt_sent_at?: number | null;
+  last_prompt_at?: number | null;
+  expires_at?: number | null;
+  confirmed_at?: number | null;
+  delivered_at?: number | null;
+  reminder_count?: number;
+  last_reminder_at?: number | null;
+  error?: string;
+  created_at?: number;
+  updated_at?: number;
+  order_status?: string;
+  amount?: string | number;
+  item_title?: string;
+}
+
 export type ProductPublishStatus = 'draft' | 'published' | 'failed' | string;
 
 export interface ProductMaterial {

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Order, OrderStatus, Item, AccountDetail } from '../types';
-import { getOrders, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems, syncSoldOrders, getAccountDetails, requireOrderFlower, rateOrders, getSellerFeatureFlags } from '../services/api';
+import { Order, OrderStatus, Item, AccountDetail, DeliveryConfirmationRecord } from '../types';
+import { getOrders, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems, syncSoldOrders, getAccountDetails, requireOrderFlower, rateOrders, getSellerFeatureFlags, getDeliveryConfirmations, resendDeliveryConfirmation, cancelDeliveryConfirmation } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, ExternalLink, Trash2, ClipboardList, Flower2, Star } from 'lucide-react';
 import { EmptyState, PageHeader, PageTabs } from './ui';
@@ -77,6 +77,10 @@ const OrderList: React.FC = () => {
   const [rateValue, setRateValue] = useState<1 | 0 | -1>(1);
   const [rateAnonymous, setRateAnonymous] = useState(false);
   const [rateSubmitting, setRateSubmitting] = useState(false);
+  // 付款后确认发货：待确认列表
+  const [confirmations, setConfirmations] = useState<DeliveryConfirmationRecord[]>([]);
+  const [showConfirmations, setShowConfirmations] = useState(false);
+  const [confirmationBusyId, setConfirmationBusyId] = useState<number | null>(null);
 
   // 搜索过滤订单
   const filterOrders = (ordersToFilter: Order[]): Order[] => {
@@ -318,6 +322,56 @@ const OrderList: React.FC = () => {
       }
   };
 
+  const loadConfirmations = async () => {
+    try {
+      const items = await getDeliveryConfirmations('active', accountFilter || undefined);
+      setConfirmations(items);
+    } catch (error) {
+      console.error('加载待确认发货记录失败:', error);
+    }
+  };
+
+  useEffect(() => {
+    void loadConfirmations();
+    const timer = setInterval(() => void loadConfirmations(), 30000);
+    return () => clearInterval(timer);
+  }, [accountFilter]);
+
+  const handleResendConfirmation = async (record: DeliveryConfirmationRecord) => {
+    setConfirmationBusyId(record.id);
+    try {
+      const res = await resendDeliveryConfirmation(record.id);
+      notify(res?.message || (res?.success ? '确认文案已重发' : '重发失败'), res?.success === false ? 'error' : 'success');
+      await loadConfirmations();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '重发失败', 'error');
+    } finally {
+      setConfirmationBusyId(null);
+    }
+  };
+
+  const handleCancelConfirmation = async (record: DeliveryConfirmationRecord) => {
+    const ok = await confirmAction(
+      `取消订单 ${record.order_id} 的确认等待？订单会保持待发货，需要你手动处理。`
+    );
+    if (!ok) return;
+    setConfirmationBusyId(record.id);
+    try {
+      const res = await cancelDeliveryConfirmation(record.id);
+      notify(res?.message || '已取消确认等待');
+      await loadConfirmations();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '取消失败', 'error');
+    } finally {
+      setConfirmationBusyId(null);
+    }
+  };
+
+  const handleManualShipConfirmation = (record: DeliveryConfirmationRecord) => {
+    setShowConfirmations(false);
+    handleShip(record.order_id);
+  };
+
   const handleViewDetail = (order: Order) => {
     setSelectedOrder(order);
     setShowDetailModal(true);
@@ -493,6 +547,27 @@ const OrderList: React.FC = () => {
           </>
         )}
       />
+
+      {confirmations.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setShowConfirmations(true)}
+          className="mb-4 flex w-full items-center justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-left transition-colors hover:bg-amber-100"
+        >
+          <div className="flex items-center gap-3">
+            <PackageCheck className="h-5 w-5 text-amber-700" />
+            <div>
+              <p className="text-sm font-bold text-amber-900">
+                待确认发货 {confirmations.length} 笔
+              </p>
+              <p className="text-xs text-amber-700">
+                买家已付款，正在等待回复确认关键词；超时不会自动发货
+              </p>
+            </div>
+          </div>
+          <span className="text-xs font-bold text-amber-800">查看处理 →</span>
+        </button>
+      )}
 
       <div className="metric-grid metric-grid--compact">
         <div className="metric-card">
@@ -880,6 +955,144 @@ const OrderList: React.FC = () => {
                   </button>
                 )}
               </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* 待确认发货 */}
+      {showConfirmations && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container modal-container-lg">
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900">
+                  <PackageCheck className="h-5 w-5 text-amber-600" />
+                  待确认发货
+                </h3>
+                <p className="mt-1 text-xs text-gray-500">
+                  买家回复确认关键词后会自动发货；超时只通知卖家，不会自动发卡。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowConfirmations(false)}
+                className="rounded-md p-2 hover:bg-gray-100"
+                aria-label="关闭待确认发货"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="modal-body">
+              {confirmations.length === 0 ? (
+                <EmptyState
+                  title="暂无待确认订单"
+                  description="买家付款后，如果商品启用了付款后确认，会出现在这里。"
+                  icon={PackageCheck}
+                />
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="data-table min-w-[720px]">
+                    <thead>
+                      <tr>
+                        <th>订单 / 商品</th>
+                        <th>买家</th>
+                        <th>状态</th>
+                        <th>剩余时间</th>
+                        <th className="text-right">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {confirmations.map(record => {
+                        const statusLabels: Record<string, string> = {
+                          pending: '待发送',
+                          prompt_sent: '等待回复',
+                          prompt_failed: '发送失败',
+                          confirmed: '发货中',
+                        };
+                        const remaining = record.expires_at
+                          ? Math.max(0, record.expires_at - Math.floor(Date.now() / 1000))
+                          : null;
+                        const remainingLabel = remaining === null
+                          ? '尚未开始'
+                          : `${Math.floor(remaining / 60)} 分 ${remaining % 60} 秒`;
+                        const busy = confirmationBusyId === record.id;
+                        return (
+                          <tr key={record.id}>
+                            <td>
+                              <p className="font-mono text-xs font-bold text-gray-800">{record.order_id}</p>
+                              <p className="mt-1 max-w-[220px] truncate text-xs text-gray-500">
+                                {record.item_title || record.item_id || '未知商品'}
+                              </p>
+                            </td>
+                            <td>
+                              <p className="text-xs font-semibold text-gray-800">
+                                {record.buyer_name || '买家'}
+                              </p>
+                              <p className="font-mono text-[10px] text-gray-400">{record.buyer_id}</p>
+                            </td>
+                            <td>
+                              <span className={`inline-flex rounded px-2 py-1 text-xs font-bold ${
+                                record.status === 'prompt_failed'
+                                  ? 'bg-red-100 text-red-700'
+                                  : record.status === 'confirmed'
+                                    ? 'bg-blue-100 text-blue-700'
+                                    : 'bg-amber-100 text-amber-800'
+                              }`}>
+                                {statusLabels[record.status] || record.status}
+                              </span>
+                              {record.reminder_count ? (
+                                <p className="mt-1 text-[10px] text-gray-400">已提醒 {record.reminder_count} 次</p>
+                              ) : null}
+                            </td>
+                            <td className="text-xs font-semibold text-gray-700">{remainingLabel}</td>
+                            <td>
+                              <div className="flex items-center justify-end gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => void handleResendConfirmation(record)}
+                                  disabled={busy || record.status === 'confirmed'}
+                                  className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs font-semibold text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  {busy ? '处理中...' : '重发'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleCancelConfirmation(record)}
+                                  disabled={busy || record.status === 'confirmed'}
+                                  className="rounded-md border border-red-200 px-2.5 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  取消
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleManualShipConfirmation(record)}
+                                  disabled={busy}
+                                  className="rounded-md bg-gray-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  手动发货
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            <div className="modal-footer">
+              <button
+                type="button"
+                onClick={() => setShowConfirmations(false)}
+                className="ios-btn-secondary w-full rounded-md px-4 py-2.5 text-sm"
+              >
+                关闭
+              </button>
             </div>
           </div>
         </div>,

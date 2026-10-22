@@ -17,6 +17,18 @@ from app.specification import (
     canonicalize_specification,
     specification_text,
 )
+from app.delivery_confirmation import (
+    DEFAULT_CONFIRM_KEYWORDS,
+    DEFAULT_CONFIRM_TEXT,
+    DEFAULT_EXCLUDE_KEYWORDS,
+    DEFAULT_MAX_REMINDERS,
+    DEFAULT_REMINDER_MINUTES,
+    DEFAULT_REMINDER_TEXT,
+    DEFAULT_TIMEOUT_MINUTES,
+    normalize_max_reminders,
+    normalize_reminder_minutes,
+    normalize_timeout_minutes,
+)
 
 _UNSET = object()
 
@@ -855,6 +867,99 @@ class DBManager:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_item_relist_cookie_enabled
                 ON item_relist_settings(cookie_id, enabled)
+            ''')
+
+            # 付款后确认发货：账号级默认配置、商品级覆盖、每订单确认状态。
+            # 等待确认期间不扣减卡密，状态独立于 orders.order_status（订单同步会覆盖后者）。
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS delivery_confirmation_settings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    cookie_id TEXT NOT NULL UNIQUE,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    confirm_text TEXT NOT NULL DEFAULT '',
+                    confirm_keywords TEXT NOT NULL DEFAULT '确认发货|确认',
+                    exclude_keywords TEXT NOT NULL DEFAULT '不确认|取消订单|申请退款|不买了|不要了',
+                    timeout_minutes INTEGER NOT NULL DEFAULT 30,
+                    reminder_minutes INTEGER NOT NULL DEFAULT 10,
+                    max_reminders INTEGER NOT NULL DEFAULT 2,
+                    reminder_text TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS item_delivery_confirmation_settings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    cookie_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    use_account_default INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    confirm_text TEXT,
+                    confirm_keywords TEXT,
+                    exclude_keywords TEXT,
+                    timeout_minutes INTEGER,
+                    reminder_minutes INTEGER,
+                    max_reminders INTEGER,
+                    reminder_text TEXT,
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(cookie_id, item_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_item_delivery_confirm_cookie
+                ON item_delivery_confirmation_settings(cookie_id, use_account_default)
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS delivery_confirmations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    cookie_id TEXT NOT NULL,
+                    order_id TEXT NOT NULL,
+                    item_id TEXT,
+                    buyer_id TEXT,
+                    buyer_name TEXT,
+                    chat_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','prompt_sent','prompt_failed',
+                                         'confirmed','delivered','expired',
+                                         'cancelled','delivery_failed')),
+                    prompt_text TEXT,
+                    keywords TEXT,
+                    exclude_keywords TEXT,
+                    timeout_minutes INTEGER,
+                    reminder_text TEXT,
+                    reminder_minutes INTEGER,
+                    max_reminders INTEGER,
+                    prompt_attempts INTEGER NOT NULL DEFAULT 0,
+                    prompt_sent_at INTEGER,
+                    last_prompt_at INTEGER,
+                    prompt_message_id TEXT,
+                    expires_at INTEGER,
+                    confirmed_at INTEGER,
+                    confirmed_message_id TEXT,
+                    delivered_at INTEGER,
+                    reminder_count INTEGER NOT NULL DEFAULT 0,
+                    last_reminder_at INTEGER,
+                    error TEXT,
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(cookie_id, order_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_delivery_confirmation_chat
+                ON delivery_confirmations(cookie_id, chat_id, status)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_delivery_confirmation_due
+                ON delivery_confirmations(cookie_id, status, expires_at)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_delivery_confirmation_user
+                ON delivery_confirmations(user_id, status, created_at DESC)
             ''')
 
             # 创建默认回复记录表（记录已回复的chat_id）
@@ -3981,7 +4086,10 @@ class DBManager:
 
                         # 备份其他相关表
                         related_tables = ['cookie_status', 'default_replies', 'message_notifications',
-                                        'item_info', 'ai_reply_settings', 'ai_conversations']
+                                        'item_info', 'ai_reply_settings', 'ai_conversations',
+                                        'delivery_confirmation_settings',
+                                        'item_delivery_confirmation_settings',
+                                        'delivery_confirmations']
 
                         for table in related_tables:
                             cursor.execute(f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -3997,7 +4105,10 @@ class DBManager:
                         'cookies', 'keywords', 'cookie_status', 'cards',
                         'delivery_rules', 'default_replies', 'notification_channels',
                         'message_notifications', 'system_settings', 'item_info',
-                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache'
+                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
+                        'delivery_confirmation_settings',
+                        'item_delivery_confirmation_settings',
+                        'delivery_confirmations'
                     ]
 
                     for table in tables:
@@ -4040,7 +4151,10 @@ class DBManager:
 
                         # 删除用户相关数据
                         related_tables = ['message_notifications', 'default_replies', 'item_info',
-                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings']
+                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings',
+                                        'delivery_confirmation_settings',
+                                        'item_delivery_confirmation_settings',
+                                        'delivery_confirmations']
 
                         for table in related_tables:
                             cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -4052,7 +4166,10 @@ class DBManager:
                     tables = [
                         'message_notifications', 'notification_channels', 'default_replies',
                         'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
-                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies'
+                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies',
+                        'delivery_confirmation_settings',
+                        'item_delivery_confirmation_settings',
+                        'delivery_confirmations'
                     ]
 
                     for table in tables:
@@ -4067,7 +4184,10 @@ class DBManager:
                     if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
                                         'delivery_rules', 'default_replies', 'notification_channels',
                                         'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache']:
+                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
+                                        'delivery_confirmation_settings',
+                                        'item_delivery_confirmation_settings',
+                                        'delivery_confirmations']:
                         continue
 
                     columns = table_data['columns']
@@ -5753,6 +5873,20 @@ class DBManager:
                 logger.error(f"获取已发货卡密记录失败: {e}")
                 return {'total': 0, 'shipments': []}
 
+    def has_card_shipments(self, order_id: str) -> bool:
+        """判断订单是否已经写入过卡密发货记录。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT 1 FROM card_shipments WHERE order_id = ? LIMIT 1",
+                    (str(order_id),),
+                )
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"查询订单卡密发货记录失败: {e}")
+            return False
+
     def clear_card_shipments(self, user_id: int = None) -> int:
         """清空已发货卡密记录，返回删除条数。"""
         with self.lock:
@@ -7045,6 +7179,16 @@ class DBManager:
                     'DELETE FROM item_delivery_configs WHERE cookie_id = ? AND item_id = ?',
                     (cookie_id, item_id),
                 )
+                cursor.execute(
+                    'DELETE FROM item_delivery_confirmation_settings '
+                    'WHERE cookie_id = ? AND item_id = ?',
+                    (cookie_id, item_id),
+                )
+                cursor.execute(
+                    'DELETE FROM delivery_confirmations '
+                    'WHERE cookie_id = ? AND item_id = ?',
+                    (cookie_id, item_id),
+                )
                 cursor.execute('DELETE FROM item_info WHERE cookie_id = ? AND item_id = ?',
                              (cookie_id, item_id))
 
@@ -7103,6 +7247,16 @@ class DBManager:
                         )
                         cursor.execute(
                             'DELETE FROM item_delivery_configs WHERE cookie_id = ? AND item_id = ?',
+                            (cookie_id, item_id),
+                        )
+                        cursor.execute(
+                            'DELETE FROM item_delivery_confirmation_settings '
+                            'WHERE cookie_id = ? AND item_id = ?',
+                            (cookie_id, item_id),
+                        )
+                        cursor.execute(
+                            'DELETE FROM delivery_confirmations '
+                            'WHERE cookie_id = ? AND item_id = ?',
                             (cookie_id, item_id),
                         )
                         cursor.execute('DELETE FROM item_info WHERE cookie_id = ? AND item_id = ?',
@@ -7293,6 +7447,11 @@ class DBManager:
 
                 # 4. 删除用户的通知渠道
                 cursor.execute('DELETE FROM notification_channels WHERE user_id = ?', (user_id,))
+
+                # 4.1 删除用户的确认发货配置和记录
+                cursor.execute('DELETE FROM delivery_confirmations WHERE user_id = ?', (user_id,))
+                cursor.execute('DELETE FROM item_delivery_confirmation_settings WHERE user_id = ?', (user_id,))
+                cursor.execute('DELETE FROM delivery_confirmation_settings WHERE user_id = ?', (user_id,))
 
                 # 5. 删除用户的Cookie
                 cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
@@ -7563,6 +7722,15 @@ class DBManager:
                       AND NOT EXISTS (
                           SELECT 1 FROM card_shipments s
                           WHERE s.order_id = o.order_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delivery_confirmations dc
+                          WHERE dc.cookie_id = o.cookie_id
+                            AND dc.order_id = o.order_id
+                            AND dc.status IN (
+                                'pending','prompt_sent','prompt_failed',
+                                'expired','cancelled','delivery_failed'
+                            )
                       )
                     ORDER BY o.created_at ASC
                     LIMIT ?
@@ -8158,6 +8326,658 @@ class DBManager:
         except Exception as e:
             logger.error(f"记录商品回复触发失败: {e}")
             return False
+
+    # ==================== 付款后确认发货 ====================
+
+    @staticmethod
+    def _clean_optional_text(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value)
+        return text if text.strip() else None
+
+    def get_delivery_confirmation_settings(self, cookie_id: str,
+                                           user_id: int = None) -> Optional[Dict[str, Any]]:
+        """读取账号级确认发货配置。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                sql = "SELECT * FROM delivery_confirmation_settings WHERE cookie_id = ?"
+                params: List[Any] = [cookie_id]
+                if user_id is not None:
+                    sql += " AND user_id = ?"
+                    params.append(user_id)
+                cursor.execute(sql, params)
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [description[0] for description in cursor.description]
+                return dict(zip(columns, row))
+        except Exception as e:
+            logger.error(f"读取账号确认发货配置失败: {e}")
+            return None
+
+    def save_delivery_confirmation_settings(
+        self,
+        user_id: int,
+        cookie_id: str,
+        enabled: bool,
+        confirm_text: str,
+        confirm_keywords: str,
+        exclude_keywords: str,
+        timeout_minutes: int,
+        reminder_minutes: int,
+        max_reminders: int,
+        reminder_text: str = "",
+    ) -> bool:
+        """保存账号级确认发货配置。"""
+        try:
+            timeout = normalize_timeout_minutes(timeout_minutes)
+            reminder = normalize_reminder_minutes(reminder_minutes, timeout)
+            max_count = normalize_max_reminders(max_reminders)
+            now = int(time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO delivery_confirmation_settings
+                        (user_id, cookie_id, enabled, confirm_text, confirm_keywords,
+                         exclude_keywords, timeout_minutes, reminder_minutes,
+                         max_reminders, reminder_text, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cookie_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        enabled = excluded.enabled,
+                        confirm_text = excluded.confirm_text,
+                        confirm_keywords = excluded.confirm_keywords,
+                        exclude_keywords = excluded.exclude_keywords,
+                        timeout_minutes = excluded.timeout_minutes,
+                        reminder_minutes = excluded.reminder_minutes,
+                        max_reminders = excluded.max_reminders,
+                        reminder_text = excluded.reminder_text,
+                        updated_at = excluded.updated_at
+                ''', (
+                    int(user_id or 0), cookie_id, 1 if enabled else 0,
+                    str(confirm_text or ""), str(confirm_keywords or ""),
+                    str(exclude_keywords or ""), timeout, reminder, max_count,
+                    str(reminder_text or ""), now, now,
+                ))
+                self.conn.commit()
+            return True
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"保存账号确认发货配置失败: {e}")
+            return False
+
+    def get_item_delivery_confirmation_setting(
+        self, cookie_id: str, item_id: str, user_id: int = None
+    ) -> Optional[Dict[str, Any]]:
+        """读取商品级确认发货覆盖配置。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                sql = ("SELECT * FROM item_delivery_confirmation_settings "
+                       "WHERE cookie_id = ? AND item_id = ?")
+                params: List[Any] = [cookie_id, item_id]
+                if user_id is not None:
+                    sql += " AND user_id = ?"
+                    params.append(user_id)
+                cursor.execute(sql, params)
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [description[0] for description in cursor.description]
+                return dict(zip(columns, row))
+        except Exception as e:
+            logger.error(f"读取商品确认发货配置失败: {e}")
+            return None
+
+    def save_item_delivery_confirmation_setting(
+        self,
+        user_id: int,
+        cookie_id: str,
+        item_id: str,
+        use_account_default: bool,
+        enabled: bool,
+        confirm_text: Optional[str],
+        confirm_keywords: Optional[str],
+        exclude_keywords: Optional[str],
+        timeout_minutes: Optional[int],
+        reminder_minutes: Optional[int],
+        max_reminders: Optional[int],
+        reminder_text: Optional[str],
+    ) -> bool:
+        """保存商品级确认发货覆盖配置。空字段表示继承账号配置。"""
+        try:
+            timeout = None
+            if timeout_minutes is not None and str(timeout_minutes).strip() != "":
+                timeout = normalize_timeout_minutes(timeout_minutes)
+            reminder = None
+            if reminder_minutes is not None and str(reminder_minutes).strip() != "":
+                if timeout is not None:
+                    reminder = normalize_reminder_minutes(reminder_minutes, timeout)
+                else:
+                    reminder = max(0, min(1439, int(reminder_minutes)))
+            max_count = None
+            if max_reminders is not None and str(max_reminders).strip() != "":
+                max_count = normalize_max_reminders(max_reminders)
+            now = int(time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO item_delivery_confirmation_settings
+                        (user_id, cookie_id, item_id, use_account_default, enabled,
+                         confirm_text, confirm_keywords, exclude_keywords,
+                         timeout_minutes, reminder_minutes, max_reminders,
+                         reminder_text, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cookie_id, item_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        use_account_default = excluded.use_account_default,
+                        enabled = excluded.enabled,
+                        confirm_text = excluded.confirm_text,
+                        confirm_keywords = excluded.confirm_keywords,
+                        exclude_keywords = excluded.exclude_keywords,
+                        timeout_minutes = excluded.timeout_minutes,
+                        reminder_minutes = excluded.reminder_minutes,
+                        max_reminders = excluded.max_reminders,
+                        reminder_text = excluded.reminder_text,
+                        updated_at = excluded.updated_at
+                ''', (
+                    int(user_id or 0), cookie_id, item_id,
+                    1 if use_account_default else 0, 1 if enabled else 0,
+                    self._clean_optional_text(confirm_text),
+                    self._clean_optional_text(confirm_keywords),
+                    self._clean_optional_text(exclude_keywords),
+                    timeout, reminder, max_count,
+                    self._clean_optional_text(reminder_text),
+                    now, now,
+                ))
+                self.conn.commit()
+            return True
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"保存商品确认发货配置失败: {e}")
+            return False
+
+    def list_item_delivery_confirmation_settings(
+        self, user_id: int, cookie_id: str = None
+    ) -> List[Dict[str, Any]]:
+        """列出商品级确认发货配置，供商品列表显示徽标。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                sql = '''
+                    SELECT s.*, i.item_title
+                    FROM item_delivery_confirmation_settings s
+                    LEFT JOIN item_info i
+                      ON i.cookie_id = s.cookie_id AND i.item_id = s.item_id
+                    WHERE s.user_id = ?
+                '''
+                params: List[Any] = [user_id]
+                if cookie_id:
+                    sql += " AND s.cookie_id = ?"
+                    params.append(cookie_id)
+                sql += " ORDER BY s.updated_at DESC"
+                cursor.execute(sql, params)
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"读取商品确认发货配置列表失败: {e}")
+            return []
+
+    def get_effective_delivery_confirmation(
+        self, cookie_id: str, item_id: str
+    ) -> Dict[str, Any]:
+        """解析账号默认 + 商品覆盖后的有效确认配置。"""
+        account = self.get_delivery_confirmation_settings(cookie_id) or {}
+        item = self.get_item_delivery_confirmation_setting(cookie_id, item_id) or {}
+
+        result = {
+            "enabled": bool(account.get("enabled")),
+            "confirm_text": account.get("confirm_text") or DEFAULT_CONFIRM_TEXT,
+            "confirm_keywords": account.get("confirm_keywords") or DEFAULT_CONFIRM_KEYWORDS,
+            "exclude_keywords": (
+                account.get("exclude_keywords")
+                if account.get("exclude_keywords") is not None
+                else DEFAULT_EXCLUDE_KEYWORDS
+            ),
+            "timeout_minutes": int(account.get("timeout_minutes") or DEFAULT_TIMEOUT_MINUTES),
+            "reminder_minutes": int(
+                account.get("reminder_minutes")
+                if account.get("reminder_minutes") is not None
+                else DEFAULT_REMINDER_MINUTES
+            ),
+            "max_reminders": int(
+                account.get("max_reminders")
+                if account.get("max_reminders") is not None
+                else DEFAULT_MAX_REMINDERS
+            ),
+            "reminder_text": account.get("reminder_text") or DEFAULT_REMINDER_TEXT,
+            "source": "account",
+        }
+
+        if item and not bool(item.get("use_account_default")):
+            result["source"] = "item"
+            result["enabled"] = bool(item.get("enabled"))
+            for field in (
+                "confirm_text", "confirm_keywords", "exclude_keywords",
+                "timeout_minutes", "reminder_minutes", "max_reminders",
+                "reminder_text",
+            ):
+                value = item.get(field)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    continue
+                result[field] = value
+
+        result["timeout_minutes"] = normalize_timeout_minutes(result["timeout_minutes"])
+        result["reminder_minutes"] = normalize_reminder_minutes(
+            result["reminder_minutes"], result["timeout_minutes"]
+        )
+        result["max_reminders"] = normalize_max_reminders(result["max_reminders"])
+        return result
+
+    def create_delivery_confirmation(
+        self,
+        user_id: int,
+        cookie_id: str,
+        order_id: str,
+        item_id: str,
+        buyer_id: str,
+        buyer_name: str,
+        chat_id: str,
+        prompt_text: str,
+        keywords: str,
+        exclude_keywords: str,
+        timeout_minutes: int,
+        reminder_text: str,
+        reminder_minutes: int,
+        max_reminders: int,
+    ) -> Optional[Dict[str, Any]]:
+        """创建订单确认记录；同一订单重复调用只保留第一条。"""
+        try:
+            now = int(time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT OR IGNORE INTO delivery_confirmations
+                        (user_id, cookie_id, order_id, item_id, buyer_id,
+                         buyer_name, chat_id, status, prompt_text, keywords,
+                         exclude_keywords, timeout_minutes, reminder_text,
+                         reminder_minutes, max_reminders, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    int(user_id or 0), cookie_id, order_id, item_id or "",
+                    buyer_id or "", buyer_name or "", chat_id or "",
+                    prompt_text or "", keywords or "", exclude_keywords or "",
+                    normalize_timeout_minutes(timeout_minutes),
+                    reminder_text or "", int(reminder_minutes or 0),
+                    normalize_max_reminders(max_reminders), now, now,
+                ))
+                self.conn.commit()
+            return self.get_delivery_confirmation(cookie_id, order_id)
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"创建订单确认记录失败: {e}")
+            return None
+
+    def get_delivery_confirmation(self, cookie_id: str,
+                                  order_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM delivery_confirmations
+                    WHERE cookie_id = ? AND order_id = ?
+                ''', (cookie_id, order_id))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [description[0] for description in cursor.description]
+                return dict(zip(columns, row))
+        except Exception as e:
+            logger.error(f"读取订单确认记录失败: {e}")
+            return None
+
+    def get_delivery_confirmation_by_id(
+        self, record_id: int, user_id: int = None
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                sql = "SELECT * FROM delivery_confirmations WHERE id = ?"
+                params: List[Any] = [int(record_id)]
+                if user_id is not None:
+                    sql += " AND user_id = ?"
+                    params.append(int(user_id))
+                cursor.execute(sql, params)
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [description[0] for description in cursor.description]
+                return dict(zip(columns, row))
+        except Exception as e:
+            logger.error(f"读取订单确认记录失败: {e}")
+            return None
+
+    def get_active_delivery_confirmations_by_chat(
+        self, cookie_id: str, chat_id: str
+    ) -> List[Dict[str, Any]]:
+        """读取会话里仍在等待买家回复的确认记录（含过期宽限）。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM delivery_confirmations
+                    WHERE cookie_id = ? AND chat_id = ?
+                      AND status IN ('pending','prompt_sent','prompt_failed','expired')
+                    ORDER BY created_at ASC, id ASC
+                ''', (cookie_id, chat_id))
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"读取会话确认记录失败: {e}")
+            return []
+
+    def mark_delivery_confirmation_prompt_attempt(
+        self, record_id: int, now: int = None, min_interval_seconds: int = 60
+    ) -> bool:
+        """原子抢占一次文案发送权，避免付款触发和补发循环重复发送。"""
+        try:
+            current = int(now or time.time())
+            cutoff = current - max(0, int(min_interval_seconds))
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET prompt_attempts = prompt_attempts + 1,
+                        last_prompt_at = ?, updated_at = ?
+                    WHERE id = ?
+                      AND status IN ('pending','prompt_failed')
+                      AND (last_prompt_at IS NULL OR last_prompt_at <= ?)
+                ''', (current, current, int(record_id), cutoff))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"抢占确认文案发送失败: {e}")
+            return False
+
+    def mark_delivery_confirmation_prompt_sent(
+        self, record_id: int, sent_at: int, expires_at: int,
+        message_id: str = None
+    ) -> bool:
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET status = 'prompt_sent', prompt_sent_at = ?,
+                        expires_at = ?, prompt_message_id = ?,
+                        error = NULL, updated_at = ?
+                    WHERE id = ? AND status IN ('pending','prompt_failed')
+                ''', (
+                    int(sent_at), int(expires_at), message_id or "",
+                    int(sent_at), int(record_id),
+                ))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"标记确认文案已发送失败: {e}")
+            return False
+
+    def mark_delivery_confirmation_prompt_failed(
+        self, record_id: int, error: str
+    ) -> bool:
+        try:
+            now = int(time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET status = 'prompt_failed', error = ?, updated_at = ?
+                    WHERE id = ? AND status IN ('pending','prompt_failed')
+                ''', (str(error or ""), now, int(record_id)))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"标记确认文案发送失败失败: {e}")
+            return False
+
+    def mark_delivery_confirmation_confirmed(
+        self, record_id: int, confirmed_at: int = None,
+        message_id: str = None
+    ) -> bool:
+        """原子把等待中的记录置为已确认；重复关键词只有第一次成功。"""
+        try:
+            current = int(confirmed_at or time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET status = 'confirmed', confirmed_at = ?,
+                        confirmed_message_id = ?, error = NULL, updated_at = ?
+                    WHERE id = ?
+                      AND status IN ('pending','prompt_sent','prompt_failed','expired')
+                ''', (current, message_id or "", current, int(record_id)))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"标记订单已确认失败: {e}")
+            return False
+
+    def mark_delivery_confirmation_delivered(
+        self, record_id: int, delivered_at: int = None
+    ) -> bool:
+        try:
+            current = int(delivered_at or time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET status = 'delivered', delivered_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'confirmed'
+                ''', (current, current, int(record_id)))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"标记确认发货完成失败: {e}")
+            return False
+
+    def reset_delivery_confirmation_for_resend(self, record_id: int) -> bool:
+        """手动重发前把记录恢复到 pending，并清空超时/提醒计数。"""
+        try:
+            now = int(time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET status = 'pending', prompt_attempts = 0,
+                        last_prompt_at = NULL, prompt_sent_at = NULL,
+                        expires_at = NULL, reminder_count = 0,
+                        last_reminder_at = NULL, error = NULL, updated_at = ?
+                    WHERE id = ? AND status IN ('pending','prompt_sent','prompt_failed','expired')
+                ''', (now, int(record_id)))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"重置确认记录失败: {e}")
+            return False
+
+    def mark_delivery_confirmation_status(
+        self, record_id: int, status: str, error: str = None
+    ) -> bool:
+        allowed = {
+            "pending", "prompt_sent", "prompt_failed", "confirmed",
+            "delivered", "expired", "cancelled", "delivery_failed",
+        }
+        if status not in allowed:
+            return False
+        try:
+            now = int(time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET status = ?, error = ?, updated_at = ?
+                    WHERE id = ? AND status NOT IN ('delivered','cancelled')
+                ''', (status, str(error or ""), now, int(record_id)))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"更新确认记录状态失败: {e}")
+            return False
+
+    def increment_delivery_confirmation_reminder(
+        self, record_id: int, now: int = None, min_interval_seconds: int = 0
+    ) -> bool:
+        """原子抢占一次提醒发送权。"""
+        try:
+            current = int(now or time.time())
+            cutoff = current - max(0, int(min_interval_seconds))
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET reminder_count = reminder_count + 1,
+                        last_reminder_at = ?, updated_at = ?
+                    WHERE id = ?
+                      AND status = 'prompt_sent'
+                      AND reminder_count < max_reminders
+                      AND (last_reminder_at IS NULL OR last_reminder_at <= ?)
+                ''', (current, current, int(record_id), cutoff))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"抢占确认提醒发送失败: {e}")
+            return False
+
+    def list_due_delivery_confirmations(
+        self, cookie_id: str, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """返回需要检查/重试/提醒的确认记录。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM delivery_confirmations
+                    WHERE cookie_id = ?
+                      AND status IN ('pending','prompt_sent','prompt_failed','confirmed')
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT ?
+                ''', (cookie_id, max(1, int(limit or 100))))
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"读取待处理确认记录失败: {e}")
+            return []
+
+    def list_delivery_confirmations(
+        self,
+        user_id: int = None,
+        cookie_id: str = None,
+        statuses: List[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """列出确认记录，附带订单状态、金额和商品标题。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                sql = '''
+                    SELECT dc.*,
+                           o.order_status AS order_status,
+                           o.amount AS amount,
+                           i.item_title AS item_title
+                    FROM delivery_confirmations dc
+                    LEFT JOIN orders o
+                      ON o.order_id = dc.order_id AND o.cookie_id = dc.cookie_id
+                    LEFT JOIN item_info i
+                      ON i.cookie_id = dc.cookie_id AND i.item_id = dc.item_id
+                    WHERE 1=1
+                '''
+                params: List[Any] = []
+                if user_id is not None:
+                    sql += " AND dc.user_id = ?"
+                    params.append(int(user_id))
+                if cookie_id:
+                    sql += " AND dc.cookie_id = ?"
+                    params.append(cookie_id)
+                if statuses:
+                    placeholders = ",".join("?" for _ in statuses)
+                    sql += f" AND dc.status IN ({placeholders})"
+                    params.extend(statuses)
+                sql += " ORDER BY dc.created_at DESC, dc.id DESC LIMIT ?"
+                params.append(max(1, int(limit or 200)))
+                cursor.execute(sql, params)
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"读取确认记录列表失败: {e}")
+            return []
+
+    def cancel_delivery_confirmations_for_order(
+        self, order_id: str, reason: str = ""
+    ) -> int:
+        """手动发货/订单关闭时取消未完成的确认记录。"""
+        try:
+            now = int(time.time())
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE delivery_confirmations
+                    SET status = 'cancelled', error = ?, updated_at = ?
+                    WHERE order_id = ?
+                      AND status IN ('pending','prompt_sent','prompt_failed',
+                                     'confirmed','expired')
+                ''', (str(reason or ""), now, str(order_id)))
+                self.conn.commit()
+                return int(cursor.rowcount or 0)
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"取消订单确认记录失败: {e}")
+            return 0
 
     # ==================== 商品自动重新上架 ====================
 

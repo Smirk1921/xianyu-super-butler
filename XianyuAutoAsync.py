@@ -26,6 +26,16 @@ import aiohttp
 from collections import defaultdict
 from app.db_manager import db_manager
 from app.specification import combine_legacy_specification
+from app.delivery_confirmation import (
+    build_confirmation_prompt,
+    build_reminder_text,
+    compute_expires_at,
+    find_excluded_keyword,
+    find_matching_keyword,
+    message_within_expiry,
+    parse_keyword_list,
+    reminder_due,
+)
 from utils.log_sanitizer import redact_log_record, redact_sensitive_text
 from utils.user_agents import CHROME_UA, SEC_CH_UA
 
@@ -508,6 +518,12 @@ class XianyuLive:
                 else:
                     logger.debug(f"【{self.cookie_id}】发货超时检查已完成，跳过")
 
+            if self.delivery_confirmation_task:
+                if not self.delivery_confirmation_task.done():
+                    tasks_to_cancel.append(("确认发货检查", self.delivery_confirmation_task))
+                else:
+                    logger.debug(f"【{self.cookie_id}】确认发货检查已完成，跳过")
+
             if self.buyer_interaction_task:
                 if not self.buyer_interaction_task.done():
                     tasks_to_cancel.append(("买家互动任务", self.buyer_interaction_task))
@@ -527,6 +543,7 @@ class XianyuLive:
                 self.item_relist_task = None
                 self.seller_session_task = None
                 self.delivery_timeout_task = None
+                self.delivery_confirmation_task = None
                 self.buyer_interaction_task = None
                 return
             
@@ -668,6 +685,7 @@ class XianyuLive:
             self.item_relist_task = None
             self.seller_session_task = None
             self.delivery_timeout_task = None
+            self.delivery_confirmation_task = None
             self.buyer_interaction_task = None
             logger.info(f"【{self.cookie_id}】后台任务引用已全部重置")
 
@@ -940,6 +958,9 @@ class XianyuLive:
         # 自己发送消息触发关键词时，用于识别机器人回复回声和限制触发频率
         self._recent_bot_replies = {}
         self._self_keyword_last_trigger = {}
+        # 确认发货：买家未回复时的检查任务，以及确认文案发送时间（抑制自触发回声）
+        self.delivery_confirmation_task = None
+        self._delivery_prompt_sent_at = {}
 
         # 交易卡片落库前暂存卖家端接口返回的真实成交数据（金额、数量、收货信息）
         self._pending_order_real_values = {}
@@ -2177,6 +2198,438 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】待发货补发对账失败: {self._safe_str(e)}")
 
+    def _delivery_confirmation_context(self, order_id: str, item_id: str,
+                                       send_user_id: str, send_user_name: str,
+                                       chat_id: str) -> dict:
+        """构造确认文案/提醒文案的占位符上下文。"""
+        item_title = ""
+        try:
+            if item_id:
+                item_info = db_manager.get_item_info(self.cookie_id, item_id) or {}
+                item_title = str(item_info.get("item_title") or "").strip()
+        except Exception:
+            item_title = ""
+
+        buyer_name = str(send_user_name or "").strip()
+        if not buyer_name or buyer_name.startswith("买家"):
+            buyer_name = "亲"
+
+        return {
+            "buyer_name": buyer_name,
+            "buyer_id": send_user_id or "",
+            "item_title": item_title or "该商品",
+            "item_id": item_id or "",
+            "order_id": order_id or "",
+            "chat_id": chat_id or "",
+        }
+
+    async def _send_delivery_confirmation_message(self, chat_id: str, buyer_id: str,
+                                                  text: str, websocket) -> None:
+        """发送确认/提醒文案，并记录回声抑制时间。"""
+        if not text.strip():
+            raise ValueError("确认文案为空")
+        self._remember_bot_reply(chat_id, text)
+        self._delivery_prompt_sent_at[str(chat_id)] = time.time()
+
+        if getattr(self, "ws", None) is not None and not getattr(self.ws, "closed", False):
+            await self.send_im_text(chat_id, buyer_id, text)
+            return
+        if websocket is None:
+            raise RuntimeError("WebSocket 未连接，无法发送确认文案")
+        await self.send_msg(websocket, chat_id, buyer_id, text)
+
+    async def _send_delivery_confirmation_prompt(self, record: dict,
+                                                 websocket) -> bool:
+        """抢占并发送一次确认文案，成功返回 True。"""
+        if not record:
+            return False
+        record_id = int(record.get("id") or 0)
+        if not record_id:
+            return False
+
+        now = int(time.time())
+        claimed = db_manager.mark_delivery_confirmation_prompt_attempt(
+            record_id, now=now, min_interval_seconds=60
+        )
+        if not claimed:
+            logger.info(
+                f"【{self.cookie_id}】订单 {record.get('order_id')} 的确认文案"
+                f"正在由其他任务发送，跳过"
+            )
+            return False
+
+        prompt_text = str(record.get("prompt_text") or "").strip()
+        chat_id = str(record.get("chat_id") or "")
+        buyer_id = str(record.get("buyer_id") or "")
+        try:
+            await self._send_delivery_confirmation_message(
+                chat_id, buyer_id, prompt_text, websocket
+            )
+            expires_at = compute_expires_at(now, record.get("timeout_minutes"))
+            db_manager.mark_delivery_confirmation_prompt_sent(
+                record_id, sent_at=now, expires_at=expires_at
+            )
+            logger.info(
+                f"【{self.cookie_id}】订单 {record.get('order_id')} 已发送确认文案，"
+                f"等待买家回复关键词，超时时间 {expires_at}"
+            )
+            return True
+        except Exception as error:
+            error_message = self._safe_str(error)
+            db_manager.mark_delivery_confirmation_prompt_failed(record_id, error_message)
+            attempts = int(record.get("prompt_attempts") or 0) + 1
+            logger.error(
+                f"【{self.cookie_id}】订单 {record.get('order_id')} 确认文案发送失败"
+                f"（第 {attempts} 次）: {error_message}"
+            )
+            if attempts >= 3:
+                await self.send_delivery_failure_notification(
+                    str(record.get("buyer_name") or f"买家{record.get('buyer_id') or ''}"),
+                    str(record.get("buyer_id") or ""),
+                    str(record.get("item_id") or ""),
+                    f"确认文案发送失败（已重试 {attempts} 次），订单 {record.get('order_id')} 请人工联系买家",
+                    record.get("chat_id"),
+                )
+            return False
+
+    async def resend_delivery_confirmation(self, record_id: int,
+                                           user_id: int = None) -> tuple:
+        """手动重发确认文案，返回 (成功, 提示信息)。"""
+        record = db_manager.get_delivery_confirmation_by_id(record_id, user_id)
+        if not record:
+            return False, "确认记录不存在"
+        if str(record.get("cookie_id") or "") != str(self.cookie_id):
+            return False, "确认记录不属于当前账号"
+        if str(record.get("status") or "") in (
+            "confirmed", "delivered", "cancelled", "delivery_failed"
+        ):
+            return False, "当前状态不可重发"
+        if getattr(self, "ws", None) is None:
+            return False, "账号 WebSocket 未连接，无法发送"
+
+        if not db_manager.reset_delivery_confirmation_for_resend(record_id):
+            return False, "重置确认记录失败"
+        record = db_manager.get_delivery_confirmation_by_id(record_id)
+        if not record:
+            return False, "确认记录不存在"
+        success = await self._send_delivery_confirmation_prompt(record, self.ws)
+        if success:
+            return True, "确认文案已重新发送"
+        return False, "确认文案发送失败，请查看日志或通知"
+
+    async def _apply_delivery_confirmation_gate(
+        self,
+        order_id: str,
+        item_id: str,
+        send_user_name: str,
+        send_user_id: str,
+        chat_id: str,
+        websocket,
+        msg_time: str,
+        order_detail: dict,
+        quantity_to_send: int,
+    ) -> str:
+        """自动发货前的确认闸门。
+
+        返回 ``proceed`` 才允许继续扣库存/发卡；``hold`` 表示已发确认文案或
+        已有待确认记录；``blocked`` 表示预检失败，需要人工处理。
+        """
+        try:
+            settings = db_manager.get_effective_delivery_confirmation(
+                self.cookie_id, item_id
+            )
+            if not settings.get("enabled"):
+                return "proceed"
+
+            record = db_manager.get_delivery_confirmation(self.cookie_id, order_id)
+            if record:
+                status = str(record.get("status") or "")
+                if status == "confirmed":
+                    return "proceed"
+                if status in ("delivered", "cancelled", "expired", "delivery_failed"):
+                    logger.info(
+                        f"[{msg_time}] 【{self.cookie_id}】订单 {order_id} 确认记录"
+                        f"状态为 {status}，跳过自动发货"
+                    )
+                    return "hold"
+                if status == "prompt_sent":
+                    expires_at = record.get("expires_at")
+                    if expires_at and int(time.time()) >= int(expires_at):
+                        changed = db_manager.mark_delivery_confirmation_status(
+                            record["id"], "expired", "timeout"
+                        )
+                        if changed:
+                            await self.send_delivery_failure_notification(
+                                str(record.get("buyer_name") or f"买家{send_user_id}"),
+                                str(record.get("buyer_id") or send_user_id),
+                                str(record.get("item_id") or item_id),
+                                f"订单 {order_id} 的买家未在约定时间内回复确认关键词，"
+                                f"已超时，请人工处理",
+                                record.get("chat_id") or chat_id,
+                            )
+                        logger.warning(
+                            f"[{msg_time}] 【{self.cookie_id}】订单 {order_id} 确认等待超时"
+                        )
+                    return "hold"
+                if status in ("pending", "prompt_failed"):
+                    await self._send_delivery_confirmation_prompt(record, websocket)
+                    return "hold"
+
+                logger.warning(
+                    f"[{msg_time}] 【{self.cookie_id}】订单 {order_id} 未知确认状态 "
+                    f"{status}，跳过自动发货"
+                )
+                return "hold"
+
+            # 第一次进入：先确保订单基础信息可被补单/超时循环使用
+            existing_order = db_manager.get_order_by_id(order_id)
+            if not existing_order:
+                db_manager.insert_or_update_order(
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=send_user_id,
+                    cookie_id=self.cookie_id,
+                    chat_id=chat_id,
+                    order_status="pending_ship",
+                )
+            elif not existing_order.get("chat_id") and chat_id:
+                db_manager.insert_or_update_order(
+                    order_id=order_id, chat_id=chat_id
+                )
+
+            # 不扣库存的预检：没有规则/库存不足时不要让买家白等
+            try:
+                preview = await self._auto_delivery(
+                    item_id,
+                    None,
+                    order_id,
+                    send_user_id,
+                    order_detail=order_detail,
+                    delivery_context={},
+                    requested_item_quantity=quantity_to_send,
+                    dry_run=True,
+                )
+            except Exception as preview_error:
+                preview = {
+                    "ready": False,
+                    "reason": f"发货预检异常: {self._safe_str(preview_error)}",
+                }
+            if not isinstance(preview, dict) or not preview.get("ready"):
+                reason = (
+                    preview.get("reason")
+                    if isinstance(preview, dict)
+                    else "发货预检未通过"
+                )
+                logger.warning(
+                    f"[{msg_time}] 【{self.cookie_id}】订单 {order_id} 确认发货预检未通过: {reason}"
+                )
+                await self.send_delivery_failure_notification(
+                    send_user_name, send_user_id, item_id,
+                    f"确认发货预检未通过：{reason}",
+                    chat_id,
+                )
+                return "blocked"
+
+            keyword_text = "|".join(
+                parse_keyword_list(settings.get("confirm_keywords"))
+            ) or "确认发货|确认"
+            context = self._delivery_confirmation_context(
+                order_id, item_id, send_user_id, send_user_name, chat_id
+            )
+            prompt_text = build_confirmation_prompt(
+                settings.get("confirm_text"), keyword_text, context
+            )
+            reminder_text = build_reminder_text(
+                settings.get("reminder_text"), keyword_text, context
+            )
+            user_id = 0
+            try:
+                user_id = int(db_manager.get_cookie_owner_user(self.cookie_id) or 0)
+            except Exception:
+                user_id = 0
+
+            record = db_manager.create_delivery_confirmation(
+                user_id=user_id,
+                cookie_id=self.cookie_id,
+                order_id=order_id,
+                item_id=item_id,
+                buyer_id=send_user_id,
+                buyer_name=send_user_name,
+                chat_id=chat_id,
+                prompt_text=prompt_text,
+                keywords=keyword_text,
+                exclude_keywords=settings.get("exclude_keywords") or "",
+                timeout_minutes=settings.get("timeout_minutes"),
+                reminder_text=reminder_text,
+                reminder_minutes=settings.get("reminder_minutes"),
+                max_reminders=settings.get("max_reminders"),
+            )
+            if not record:
+                logger.error(
+                    f"[{msg_time}] 【{self.cookie_id}】订单 {order_id} 创建确认记录失败"
+                )
+                await self.send_delivery_failure_notification(
+                    send_user_name, send_user_id, item_id,
+                    "创建确认发货记录失败，请人工处理",
+                    chat_id,
+                )
+                return "blocked"
+
+            # 并发情况下其他任务可能已经创建/确认了同一订单
+            if record.get("status") == "confirmed":
+                return "proceed"
+            if record.get("status") in ("delivered", "cancelled", "expired", "delivery_failed"):
+                return "hold"
+
+            await self._send_delivery_confirmation_prompt(record, websocket)
+            return "hold"
+        except Exception as error:
+            logger.error(
+                f"【{self.cookie_id}】订单 {order_id} 确认发货闸门异常: "
+                f"{self._safe_str(error)}"
+            )
+            return "blocked"
+
+    async def _try_handle_delivery_confirmation_reply(
+        self,
+        message_data: dict,
+        send_user_name: str,
+        send_user_id: str,
+        send_message: str,
+        item_id: str,
+        chat_id: str,
+        msg_time: str,
+        message_ts: float = None,
+        session_type: str = "1",
+    ) -> bool:
+        """买家回复确认关键词时放行发货；返回 True 表示已处理。"""
+        if str(session_type or "1") == "30":
+            return False
+        if not chat_id or not str(send_message or "").strip():
+            return False
+
+        records = db_manager.get_active_delivery_confirmations_by_chat(
+            self.cookie_id, chat_id
+        )
+        if not records:
+            return False
+
+        current_ts = float(message_ts or time.time())
+        message_id = self._extract_message_id(message_data) or ""
+        for record in records:
+            record_buyer = str(record.get("buyer_id") or "").strip()
+            if record_buyer and record_buyer != str(send_user_id):
+                continue
+
+            status = str(record.get("status") or "")
+            if status == "expired" and not message_within_expiry(
+                record, current_ts, grace_seconds=60
+            ):
+                logger.info(
+                    f"[{msg_time}] 【{self.cookie_id}】订单 {record.get('order_id')} "
+                    f"确认已过期，忽略迟到的关键词"
+                )
+                continue
+            if status not in ("pending", "prompt_sent", "prompt_failed", "expired"):
+                continue
+
+            excluded = find_excluded_keyword(
+                send_message, record.get("exclude_keywords")
+            )
+            if excluded:
+                self._add_reply_decision_log(
+                    message_data,
+                    chat_id=chat_id,
+                    item_id=item_id,
+                    sender_user_id=send_user_id,
+                    sender_user_name=send_user_name,
+                    source_message=send_message,
+                    process_status="skipped",
+                    decision_reason="delivery_confirmation_excluded",
+                    reply_strategy="delivery_confirm",
+                    matched_keyword=excluded,
+                    send_status="unknown",
+                )
+                logger.info(
+                    f"[{msg_time}] 【{self.cookie_id}】买家回复命中确认排除词"
+                    f"「{excluded}」，不触发发货"
+                )
+                continue
+
+            matched = find_matching_keyword(
+                send_message,
+                record.get("keywords"),
+                record.get("exclude_keywords"),
+            )
+            if not matched:
+                continue
+
+            confirmed = db_manager.mark_delivery_confirmation_confirmed(
+                record["id"], confirmed_at=int(current_ts), message_id=message_id
+            )
+            if not confirmed:
+                logger.info(
+                    f"[{msg_time}] 【{self.cookie_id}】订单 {record.get('order_id')} "
+                    f"确认状态已被其他消息处理，跳过重复发货"
+                )
+                return True
+
+            self._add_reply_decision_log(
+                message_data,
+                chat_id=chat_id,
+                item_id=item_id,
+                sender_user_id=send_user_id,
+                sender_user_name=send_user_name,
+                source_message=send_message,
+                process_status="success",
+                decision_reason="delivery_confirmed",
+                reply_strategy="delivery_confirm",
+                matched_keyword=matched,
+                send_status="success",
+            )
+            logger.info(
+                f"[{msg_time}] 【{self.cookie_id}】买家回复确认关键词「{matched}」，"
+                f"订单 {record.get('order_id')} 开始自动发货"
+            )
+
+            target_item_id = str(record.get("item_id") or item_id or "")
+            target_buyer_id = str(record.get("buyer_id") or send_user_id or "")
+            target_buyer_name = str(record.get("buyer_name") or send_user_name or "")
+            order_id = str(record.get("order_id") or "")
+            await self._handle_auto_delivery(
+                self.ws,
+                {},
+                target_buyer_name,
+                target_buyer_id,
+                target_item_id,
+                chat_id,
+                msg_time,
+                order_id=order_id,
+            )
+
+            order = db_manager.get_order_by_id(order_id) or {}
+            # system_shipped 只在整单内容全部发送成功后才写入；card_shipments
+            # 可能在部分发送失败时已经存在，不能单独作为发货完成依据。
+            delivered = bool(order.get("system_shipped"))
+            if delivered:
+                db_manager.mark_delivery_confirmation_delivered(
+                    record["id"], delivered_at=int(time.time())
+                )
+                logger.info(
+                    f"【{self.cookie_id}】订单 {order_id} 确认后自动发货完成"
+                )
+            else:
+                db_manager.mark_delivery_confirmation_status(
+                    record["id"], "delivery_failed", "确认后自动发货未完成"
+                )
+                logger.error(
+                    f"【{self.cookie_id}】订单 {order_id} 确认后自动发货未完成，"
+                    f"已标记为需人工处理"
+                )
+            return True
+
+        return False
+
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str, order_id: str = None):
         """统一处理自动发货逻辑"""
@@ -2348,6 +2801,25 @@ class XianyuLive:
                         logger.info(f"商品 {item_id} 未开启多数量发货，发送单个卡券")
                     else:
                         logger.info(f"无订单ID，发送单个卡券")
+
+                    # 付款后确认闸门：未收到买家关键词前不扣库存、不发卡。
+                    gate_result = await self._apply_delivery_confirmation_gate(
+                        order_id=order_id,
+                        item_id=item_id,
+                        send_user_name=send_user_name,
+                        send_user_id=send_user_id,
+                        chat_id=chat_id,
+                        websocket=websocket,
+                        msg_time=msg_time,
+                        order_detail=order_detail,
+                        quantity_to_send=quantity_to_send,
+                    )
+                    if gate_result != "proceed":
+                        logger.info(
+                            f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 确认闸门结果 '
+                            f'{gate_result}，暂停发货'
+                        )
+                        return
 
                     # 先解析一次商品规格与库存绑定，再按订单数量和每件发货份数取内容。
                     delivery_contents = []
@@ -6516,6 +6988,65 @@ class XianyuLive:
                 logger.error(f"【{self.cookie_id}】获取订单详情异常: {self._safe_str(e)}")
                 return None
 
+    def _check_delivery_rule_ready(
+        self,
+        rule: dict,
+        requested_item_quantity: int = 1,
+    ) -> dict:
+        """不扣库存地检查发货规则是否可执行，供确认文案发送前预检。"""
+        try:
+            if not isinstance(rule, dict) or not rule:
+                return {"ready": False, "reason": "未匹配到发货规则"}
+
+            card_type = str(rule.get("card_type") or "")
+            if card_type == "text":
+                if not str(rule.get("text_content") or "").strip():
+                    return {"ready": False, "reason": "文字卡券内容为空"}
+                return {"ready": True, "required_count": 0, "stock_count": None}
+
+            if card_type == "image":
+                if not str(rule.get("image_url") or "").strip():
+                    return {"ready": False, "reason": "图片卡券缺少图片地址"}
+                return {"ready": True, "required_count": 0, "stock_count": None}
+
+            if card_type == "api":
+                # API 卡券的内容只能在真实发货时请求，这里只确认规则存在。
+                return {"ready": True, "required_count": 0, "stock_count": None}
+
+            if card_type == "data":
+                from app.db_manager import db_manager
+                try:
+                    item_quantity = max(1, int(requested_item_quantity or 1))
+                except (TypeError, ValueError):
+                    item_quantity = 1
+                delivery_count = max(1, int(rule.get("delivery_count") or 1))
+                required_count = item_quantity * delivery_count
+                card = db_manager.get_card_by_id(rule.get("card_id"))
+                if not card:
+                    return {"ready": False, "reason": "绑定的卡券不存在"}
+                if not bool(card.get("enabled", True)):
+                    return {"ready": False, "reason": "绑定的卡券已停用"}
+                stock_count = db_manager._card_stock_count(
+                    card.get("type") or "data", card.get("data_content")
+                )
+                if stock_count is None or stock_count < required_count:
+                    return {
+                        "ready": False,
+                        "reason": f"卡密库存不足（需要 {required_count} 条，剩余 {stock_count or 0} 条）",
+                        "required_count": required_count,
+                        "stock_count": stock_count or 0,
+                    }
+                return {
+                    "ready": True,
+                    "required_count": required_count,
+                    "stock_count": stock_count,
+                }
+
+            return {"ready": False, "reason": f"未知卡券类型: {card_type or '空'}"}
+        except Exception as e:
+            logger.error(f"发货预检失败: {self._safe_str(e)}")
+            return {"ready": False, "reason": f"发货预检异常: {self._safe_str(e)}"}
+
     async def _auto_delivery(
         self,
         item_id: str,
@@ -6526,6 +7057,7 @@ class XianyuLive:
         order_detail: dict = None,
         delivery_context: dict = None,
         requested_item_quantity: int = 1,
+        dry_run: bool = False,
     ):
         """匹配并取得发货内容；批量库存会在首次调用时按整单需求原子扣减。"""
         try:
@@ -6810,6 +7342,14 @@ class XianyuLive:
                     logger.info(f"📋 订单规格: {spec_name}:{spec_value} ➡️ 使用普通卡券兜底")
                 else:
                     logger.info(f"✅ 匹配普通发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+
+            if dry_run:
+                preview = self._check_delivery_rule_ready(
+                    rule,
+                    requested_item_quantity=requested_item_quantity,
+                )
+                preview["rule"] = rule
+                return preview
 
             # 获取延时设置
             delay_seconds = rule.get('card_delay_seconds', 0)
@@ -8263,6 +8803,166 @@ class XianyuLive:
             raise
         finally:
             logger.info(f"【{self.cookie_id}】卖家登录态检查循环已退出")
+
+    async def delivery_confirmation_loop(self):
+        """确认发货超时、提醒和失败重试。
+
+        只处理本账号的 delivery_confirmations；不依赖平台接口，每 60 秒
+        检查一次。文案发送失败会重试，超时只通知卖家，不自动发货。
+        """
+        await self._interruptible_sleep(random.uniform(0, 30))
+        try:
+            while True:
+                try:
+                    from app.cookie_manager import manager as cookie_manager
+                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                        logger.info(f"【{self.cookie_id}】账号已禁用，停止确认发货检查")
+                        break
+
+                    await self._check_delivery_confirmations()
+                    await self._interruptible_sleep(60)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"【{self.cookie_id}】确认发货检查失败: {self._safe_str(e)}"
+                    )
+                    try:
+                        await self._interruptible_sleep(60)
+                    except asyncio.CancelledError:
+                        raise
+        except asyncio.CancelledError:
+            logger.info(f"【{self.cookie_id}】确认发货检查已取消")
+            raise
+        finally:
+            logger.info(f"【{self.cookie_id}】确认发货检查已退出")
+
+    async def _check_delivery_confirmations(self):
+        """执行一轮确认记录检查。"""
+        records = db_manager.list_due_delivery_confirmations(self.cookie_id)
+        if not records:
+            return
+
+        now = int(time.time())
+        for record in records:
+            status = str(record.get("status") or "")
+            order_id = str(record.get("order_id") or "")
+            order = db_manager.get_order_by_id(order_id) or {}
+            order_status = str(order.get("order_status") or "")
+
+            # 订单已经发货/关闭/退款：确认流程不再有意义
+            if status in ("pending", "prompt_sent", "prompt_failed") and order_status and order_status != "pending_ship":
+                if bool(order.get("system_shipped")):
+                    db_manager.mark_delivery_confirmation_status(
+                        record["id"], "delivered", f"order_status:{order_status}"
+                    )
+                else:
+                    db_manager.mark_delivery_confirmation_status(
+                        record["id"], "cancelled", f"order_status:{order_status}"
+                    )
+                logger.info(
+                    f"【{self.cookie_id}】订单 {order_id} 状态变为 {order_status}，"
+                    f"关闭确认等待"
+                )
+                continue
+
+            if status == "confirmed":
+                if order_status in ("cancelled", "refunding"):
+                    db_manager.mark_delivery_confirmation_status(
+                        record["id"], "cancelled", f"order_status:{order_status}"
+                    )
+                    continue
+                if bool(order.get("system_shipped")):
+                    db_manager.mark_delivery_confirmation_delivered(
+                        record["id"], delivered_at=now
+                    )
+                    continue
+                # 给正在发送卡券的处理器留出时间，避免把“扣了库存但消息还没发完”
+                # 的中间状态误判为失败。超过 15 分钟仍未完成则转人工。
+                confirmed_at = record.get("confirmed_at")
+                if confirmed_at:
+                    try:
+                        stale = now - int(confirmed_at) > 900
+                    except (TypeError, ValueError):
+                        stale = False
+                    if stale:
+                        changed = db_manager.mark_delivery_confirmation_status(
+                            record["id"], "delivery_failed",
+                            "确认后长时间未完成发货",
+                        )
+                        if changed:
+                            await self.send_delivery_failure_notification(
+                                str(record.get("buyer_name") or f"买家{record.get('buyer_id') or ''}"),
+                                str(record.get("buyer_id") or ""),
+                                str(record.get("item_id") or ""),
+                                f"订单 {order_id} 买家已确认，但自动发货长时间未完成，"
+                                f"请人工核对",
+                                record.get("chat_id"),
+                            )
+                continue
+
+            if status == "prompt_sent":
+                expires_at = record.get("expires_at")
+                if expires_at:
+                    try:
+                        expired = now >= int(expires_at)
+                    except (TypeError, ValueError):
+                        expired = False
+                    if expired:
+                        changed = db_manager.mark_delivery_confirmation_status(
+                            record["id"], "expired", "timeout"
+                        )
+                        if changed:
+                            logger.warning(
+                                f"【{self.cookie_id}】订单 {order_id} 确认等待超时，"
+                                f"通知卖家人工处理"
+                            )
+                            await self.send_delivery_failure_notification(
+                                str(record.get("buyer_name") or f"买家{record.get('buyer_id') or ''}"),
+                                str(record.get("buyer_id") or ""),
+                                str(record.get("item_id") or ""),
+                                f"订单 {order_id} 的买家未在规定时间内回复确认关键词，"
+                                f"已超时，请人工处理",
+                                record.get("chat_id"),
+                            )
+                        continue
+
+                if reminder_due(record, now):
+                    interval = max(
+                        0, int(record.get("reminder_minutes") or 0) * 60
+                    )
+                    claimed = db_manager.increment_delivery_confirmation_reminder(
+                        record["id"], now=now, min_interval_seconds=interval
+                    )
+                    if claimed:
+                        reminder_text = str(record.get("reminder_text") or "").strip()
+                        if not reminder_text:
+                            reminder_text = str(record.get("prompt_text") or "").strip()
+                        if reminder_text and getattr(self, "ws", None) is not None:
+                            try:
+                                await self._send_delivery_confirmation_message(
+                                    str(record.get("chat_id") or ""),
+                                    str(record.get("buyer_id") or ""),
+                                    reminder_text,
+                                    self.ws,
+                                )
+                                logger.info(
+                                    f"【{self.cookie_id}】订单 {order_id} 已发送确认提醒"
+                                )
+                            except Exception as reminder_error:
+                                logger.error(
+                                    f"【{self.cookie_id}】订单 {order_id} 确认提醒发送失败: "
+                                    f"{self._safe_str(reminder_error)}"
+                                )
+                continue
+
+            if status in ("pending", "prompt_failed"):
+                attempts = int(record.get("prompt_attempts") or 0)
+                if attempts >= 3:
+                    continue
+                if getattr(self, "ws", None) is None:
+                    continue
+                await self._send_delivery_confirmation_prompt(record, self.ws)
 
     async def delivery_timeout_loop(self):
         """发货超时告警。
@@ -11170,6 +11870,7 @@ class XianyuLive:
                             if (
                                 now - self._recent_bot_replies.get(recent_key, 0) < 15
                                 or now - self._self_keyword_last_trigger.get(str(chat_id), 0) < 3
+                                or now - self._delivery_prompt_sent_at.get(str(chat_id), 0) < 60
                             ):
                                 logger.info(
                                     f"[{msg_time}] 【{self.cookie_id}】跳过机器人回复回声"
@@ -11208,6 +11909,35 @@ class XianyuLive:
                 return
             else:
                 logger.info(f"[{msg_time}] 【收到】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
+
+                # 确认发货关键词优先级最高：在系统事件、普通关键词和 AI 之前处理。
+                # 命中后直接走统一发货链路，避免买家收到无关的自动回复。
+                try:
+                    session_type_for_confirm = "1"
+                    if isinstance(message_10, dict):
+                        session_type_for_confirm = str(
+                            message_10.get("sessionType", "1")
+                        )
+                    confirmation_handled = await self._try_handle_delivery_confirmation_reply(
+                        message_data,
+                        send_user_name,
+                        send_user_id,
+                        send_message,
+                        item_id,
+                        chat_id,
+                        msg_time,
+                        message_ts=(
+                            create_time / 1000 if create_time else time.time()
+                        ),
+                        session_type=session_type_for_confirm,
+                    )
+                    if confirmation_handled:
+                        return
+                except Exception as confirm_error:
+                    logger.error(
+                        f"[{msg_time}] 【{self.cookie_id}】处理确认发货关键词失败: "
+                        f"{self._safe_str(confirm_error)}"
+                    )
 
                 # 🔔 立即发送消息通知（独立于自动回复功能）
                 # 检查是否为群组消息，如果是群组消息则跳过通知
@@ -11569,6 +12299,14 @@ class XianyuLive:
                                 tasks_started.append("发货超时检查")
                             else:
                                 logger.info(f"【{self.cookie_id}】发货超时检查已在运行，跳过启动")
+
+                            # 启动付款后确认发货检查（超时、提醒、文案重试）
+                            if not self.delivery_confirmation_task or self.delivery_confirmation_task.done():
+                                logger.info(f"【{self.cookie_id}】启动确认发货检查...")
+                                self.delivery_confirmation_task = asyncio.create_task(self.delivery_confirmation_loop())
+                                tasks_started.append("确认发货检查")
+                            else:
+                                logger.info(f"【{self.cookie_id}】确认发货检查已在运行，跳过启动")
 
                             # 启动买家互动任务（评价/求花，是否执行由开关决定）
                             if not self.buyer_interaction_task or self.buyer_interaction_task.done():

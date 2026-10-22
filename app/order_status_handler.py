@@ -347,6 +347,19 @@ class OrderStatusHandler:
                     status_text = self.status_mapping.get(new_status, new_status)
                     if self.config.get('enable_status_logging', True):
                         logger.info(f"✅ 订单状态更新成功: {order_id} -> {status_text} ({context})")
+
+                    # 订单已取消/退款时，关闭仍在等待买家确认的发货流程。
+                    # 不在 shipped 时取消：自动发货会先推进 shipped，确认记录随后
+                    # 才由关键词处理器标记为 delivered。
+                    if new_status in ('cancelled', 'refunding'):
+                        try:
+                            db_manager.cancel_delivery_confirmations_for_order(
+                                order_id, f"order_status:{new_status}"
+                            )
+                        except Exception as confirm_error:
+                            logger.warning(
+                                f"关闭订单 {order_id} 确认记录失败: {confirm_error}"
+                            )
                 else:
                     logger.error(f"❌ 订单状态更新失败: {order_id} -> {new_status} ({context})")
                 

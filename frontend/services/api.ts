@@ -3,6 +3,8 @@ import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, AdminUser, Card, CardShipment, SystemSettings, ApiResponse, OrderAnalytics,
   Item, ItemDeliveryConfig, ItemDeliveryConfigSummary,
+  DeliveryConfirmationSettings, ItemDeliveryConfirmationSettings,
+  DeliveryConfirmationRecord,
   ProductVariantBinding, AIReplySettings, ShippingRule, ReplyRule, DefaultReply,
   ItemReply,
   ItemRelistSetting,
@@ -638,6 +640,68 @@ export const saveItemDeliveryConfig = async (
     config,
   );
 }
+
+export const getDeliveryConfirmationSettings = async (
+  cookieId: string,
+): Promise<DeliveryConfirmationSettings> => {
+  return get(`/cookies/${encodeURIComponent(cookieId)}/delivery-confirmation`);
+};
+
+export const updateDeliveryConfirmationSettings = async (
+  cookieId: string,
+  data: Omit<DeliveryConfirmationSettings, 'configured'>,
+): Promise<any> => {
+  return put(`/cookies/${encodeURIComponent(cookieId)}/delivery-confirmation`, data);
+};
+
+export const getItemDeliveryConfirmation = async (
+  cookieId: string,
+  itemId: string,
+): Promise<ItemDeliveryConfirmationSettings> => {
+  return get(
+    `/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}/delivery-confirmation`,
+  );
+};
+
+export const updateItemDeliveryConfirmation = async (
+  cookieId: string,
+  itemId: string,
+  data: Partial<Omit<ItemDeliveryConfirmationSettings, 'account_defaults' | 'effective'>>,
+): Promise<any> => {
+  return put(
+    `/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}/delivery-confirmation`,
+    data,
+  );
+};
+
+export const getItemDeliveryConfirmations = async (
+  cookieId?: string,
+): Promise<ItemDeliveryConfirmationSettings[]> => {
+  const response = await get<{ items: ItemDeliveryConfirmationSettings[] }>(
+    '/item-delivery-confirmations',
+    cookieId ? { cookie_id: cookieId } : undefined,
+  );
+  return response.items || [];
+};
+
+export const getDeliveryConfirmations = async (
+  status = 'active',
+  cookieId?: string,
+): Promise<DeliveryConfirmationRecord[]> => {
+  const response = await get<{ items: DeliveryConfirmationRecord[] }>(
+    '/api/delivery-confirmations',
+    { status, ...(cookieId ? { cookie_id: cookieId } : {}) },
+  );
+  return response.items || [];
+};
+
+export const resendDeliveryConfirmation = async (recordId: number): Promise<any> => {
+  return post(`/api/delivery-confirmations/${recordId}/resend`, {});
+};
+
+export const cancelDeliveryConfirmation = async (recordId: number): Promise<any> => {
+  return post(`/api/delivery-confirmations/${recordId}/cancel`, {});
+};
 
 export type DeliverySkuOption = {
   key: string;
