@@ -109,7 +109,9 @@ class ItemRelistService:
         required = max(1, int(rule.get('delivery_count') or 1)) * min_stock
 
         if card_type == 'data':
-            stock = self.db._card_stock_count(card_type, rule.get('data_content'))
+            stock = self.db.get_card_usable_stock_count(
+                rule.get('card_id'), rule.get('data_content')
+            )
             if stock is None or stock < required:
                 return {
                     'eligible': False,

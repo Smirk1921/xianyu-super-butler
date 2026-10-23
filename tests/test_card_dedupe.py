@@ -65,9 +65,9 @@ class CardDedupeTests(unittest.TestCase):
         )
         self.assertEqual(consumed, ["b"])
 
-    def test_rejects_content_that_was_already_shipped(self):
+    def test_skips_content_that_was_already_shipped(self):
         self.manager.consume_batch_data_batch(self.card_id, 1, order_id="order-1")
-        # 模拟历史库存里还留着一条已经发过的重复行
+        # 模拟历史库存里还留着一条已经发过的重复行，后面还有新卡
         self.manager.conn.execute(
             "UPDATE cards SET data_content='a\nb' WHERE id=?", (self.card_id,)
         )
@@ -76,10 +76,10 @@ class CardDedupeTests(unittest.TestCase):
         consumed = self.manager.consume_batch_data_batch(
             self.card_id, 1, order_id="order-2"
         )
-        self.assertIsNone(consumed)
-        self.assertEqual(self._data_content(), "a\nb")
+        self.assertEqual(consumed, ["b"])
+        self.assertEqual(self._data_content(), "")
 
-    def test_rejects_internal_duplicate_lines(self):
+    def test_skips_internal_duplicate_lines(self):
         self.manager.conn.execute(
             "UPDATE cards SET data_content='x\nx' WHERE id=?", (self.card_id,)
         )
@@ -89,7 +89,24 @@ class CardDedupeTests(unittest.TestCase):
             self.card_id, 2, order_id="order-3"
         )
         self.assertIsNone(consumed)
-        self.assertEqual(self._data_content(), "x\nx")
+        # 重复行会被清理，只保留一行可用库存
+        self.assertEqual(self._data_content(), "x")
+
+    def test_all_content_already_shipped_clears_inventory(self):
+        self.manager.consume_batch_data_batch(self.card_id, 1, order_id="order-1")
+        self.manager.conn.execute(
+            "UPDATE cards SET data_content='a' WHERE id=?", (self.card_id,)
+        )
+        self.manager.conn.commit()
+
+        consumed = self.manager.consume_batch_data_batch(
+            self.card_id, 1, order_id="order-2"
+        )
+        self.assertIsNone(consumed)
+        self.assertEqual(self._data_content(), "")
+        self.assertEqual(
+            self.manager.get_card_usable_stock_count(self.card_id, "a"), 0
+        )
 
 
 if __name__ == "__main__":

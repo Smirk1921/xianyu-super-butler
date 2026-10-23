@@ -5838,34 +5838,40 @@ class DBManager:
                     )
                     return None
 
-                consumed_lines = lines[:requested_quantity]
-                remaining_lines = lines[requested_quantity:]
+                # 库存里可能残留已经发过的行或重复行。它们不能再次发给买家，
+                # 但也不应该让整单直接失败：先跳过并清理，只消费真正可用的行。
+                cursor.execute(
+                    "SELECT content FROM card_shipments WHERE card_id = ?",
+                    (card_id,),
+                )
+                shipped_contents = {
+                    row[0] for row in cursor.fetchall() if row[0]
+                }
+                seen_contents = set()
+                fresh_lines = []
+                for line in lines:
+                    if line in shipped_contents or line in seen_contents:
+                        continue
+                    seen_contents.add(line)
+                    fresh_lines.append(line)
 
-                # 同一张卡密只能发一次。库存里如果还留着已发货过的重复行，
-                # 宁可直接拒绝并提示清理，也不能再卖给第二个买家。
-                if len(set(consumed_lines)) != len(consumed_lines):
-                    logger.error(
-                        f"拒绝重复消费: 卡券ID={card_id} 本次待发货内容内部存在重复行，"
-                        "请先清理库存中的重复卡密"
+                if len(fresh_lines) < requested_quantity:
+                    new_data_content = '\n'.join(fresh_lines)
+                    if new_data_content != data_content:
+                        cursor.execute('''
+                            UPDATE cards
+                            SET data_content = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        ''', (new_data_content, card_id))
+                        self.conn.commit()
+                    logger.warning(
+                        f"卡券 {card_id} 可用库存不足: 需要={requested_quantity}条, "
+                        f"可用={len(fresh_lines)}条；已跳过并清理已发货/重复内容"
                     )
                     return None
-                for content in consumed_lines:
-                    duplicate = cursor.execute(
-                        "SELECT 1 FROM card_shipments WHERE card_id = ? AND content = ? LIMIT 1",
-                        (card_id, content),
-                    ).fetchone()
-                    if duplicate:
-                        import hashlib
-                        fingerprint = hashlib.sha256(
-                            content.encode("utf-8", "ignore")
-                        ).hexdigest()[:12]
-                        logger.error(
-                            f"拒绝重复消费: 卡券ID={card_id} 的待发货内容已存在发货记录 "
-                            f"(order_id={order_id or ''}, 内容指纹={fingerprint})；"
-                            "请清理库存中的重复卡密后再发货"
-                        )
-                        return None
 
+                consumed_lines = fresh_lines[:requested_quantity]
+                remaining_lines = fresh_lines[requested_quantity:]
                 new_data_content = '\n'.join(remaining_lines)
 
                 cursor.execute('''
@@ -6365,6 +6371,41 @@ class DBManager:
             return None
         return len([line for line in (data_content or "").splitlines() if line.strip()])
 
+    def get_card_usable_stock_count(
+        self, card_id: Optional[int], data_content: Optional[str]
+    ) -> int:
+        """统计批量卡密中真正可用的行数：去掉重复行和已发货内容。"""
+        if not data_content:
+            return 0
+        lines = [line.strip() for line in data_content.splitlines() if line.strip()]
+        if not lines:
+            return 0
+
+        shipped_contents = set()
+        if card_id:
+            try:
+                with self.lock:
+                    cursor = self.conn.cursor()
+                    cursor.execute(
+                        "SELECT content FROM card_shipments WHERE card_id = ?",
+                        (int(card_id),),
+                    )
+                    shipped_contents = {
+                        row[0] for row in cursor.fetchall() if row[0]
+                    }
+            except Exception as e:
+                logger.error(f"读取卡密发货记录失败: {e}")
+                return 0
+
+        seen = set()
+        available = 0
+        for line in lines:
+            if line in shipped_contents or line in seen:
+                continue
+            seen.add(line)
+            available += 1
+        return available
+
     def get_item_delivery_config(
         self,
         cookie_id: str,
@@ -6434,7 +6475,10 @@ class DBManager:
                     "card_name": row[14],
                     "card_type": row[15],
                     "card_enabled": bool(row[16]) if row[16] is not None else False,
-                    "stock_count": self._card_stock_count(row[15], row[17]),
+                    "stock_count": (
+                        self.get_card_usable_stock_count(row[10], row[17])
+                        if row[15] == "data" else None
+                    ),
                     "text_content": row[18],
                     "image_url": row[19],
                     "api_config": row[20],
