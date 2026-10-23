@@ -17,6 +17,7 @@ const CardList: React.FC = () => {
     type: 'text' as Card['type'],
     content: '',
     description: '',
+    description_position: 'before' as 'before' | 'after',
     enabled: true,
     delay_seconds: 0
   });
@@ -55,6 +56,7 @@ const CardList: React.FC = () => {
       // 通用配置
       delay_seconds: card.delay_seconds || 0,
       description: card.description || '',
+      description_position: card.description_position === 'after' ? 'after' : 'before',
       enabled: card.enabled
     });
     setShowEditModal(true);
@@ -78,6 +80,7 @@ const CardList: React.FC = () => {
         name: editForm.name.trim(),
         type: editForm.type as any,
         description: editForm.description?.trim(),
+        description_position: editForm.description_position === 'after' ? 'after' : 'before',
         delay_seconds: editForm.delay_seconds || 0,
         enabled: editForm.enabled ?? true
       };
@@ -137,6 +140,7 @@ const CardList: React.FC = () => {
         name,
         type: addForm.type,
         description: addForm.description.trim(),
+        description_position: addForm.description_position,
         enabled: addForm.enabled,
         delay_seconds: addForm.delay_seconds
       };
@@ -162,6 +166,7 @@ const CardList: React.FC = () => {
         type: 'text',
         content: '',
         description: '',
+        description_position: 'before',
         enabled: true,
         delay_seconds: 0
       });
@@ -546,6 +551,21 @@ const CardList: React.FC = () => {
                     className="ios-input h-32 w-full resize-y rounded-md px-3 py-2.5"
                     placeholder="可选的备注信息"
                   />
+                  <label className="mt-3 block text-sm font-bold text-gray-700 mb-2">备注位置</label>
+                  <select
+                    value={editForm.description_position === 'after' ? 'after' : 'before'}
+                    onChange={(e) => setEditForm({
+                      ...editForm,
+                      description_position: e.target.value as 'before' | 'after',
+                    })}
+                    className="ios-input w-full rounded-md px-3 py-2.5"
+                  >
+                    <option value="before">卡密前面</option>
+                    <option value="after">卡密后面</option>
+                  </select>
+                  <p className="mt-1 text-xs text-gray-500">
+                    备注里使用 {'{DELIVERY_CONTENT}'} 占位符时，以占位符位置为准。
+                  </p>
                 </div>
 
                 {/* 启用状态 */}
@@ -710,6 +730,18 @@ const CardList: React.FC = () => {
                     placeholder="卡密用途描述"
                     className="ios-input h-20 w-full resize-y rounded-md px-3 py-2.5"
                   />
+                  <label className="mt-3 block text-sm font-bold text-gray-700 mb-2">备注位置</label>
+                  <select
+                    value={addForm.description_position}
+                    onChange={(e) => setAddForm({
+                      ...addForm,
+                      description_position: e.target.value as 'before' | 'after',
+                    })}
+                    className="ios-input w-full rounded-md px-3 py-2.5"
+                  >
+                    <option value="before">卡密前面</option>
+                    <option value="after">卡密后面</option>
+                  </select>
                 </div>
 
                 <div>

@@ -113,6 +113,8 @@ export interface Card {
   name: string;
   type: 'api' | 'text' | 'data' | 'image';
   description?: string;
+  /** 备注放在卡密前还是后 */
+  description_position?: 'before' | 'after';
   enabled: boolean;
   // 文本类型
   text_content?: string;
@@ -164,6 +166,7 @@ export interface Item {
   item_category?: string;
   is_multi_spec?: number | boolean;
   multi_quantity_delivery?: number | boolean;
+  is_pinned?: number | boolean;
   /** 'on_sale' | 'off_shelf'：闲鱼接口是否还返回这件商品。
    *  同步只做 upsert，下架或删除的商品会留在库里，靠这个字段区分。 */
   listing_status?: string;
@@ -207,6 +210,23 @@ export interface ItemDeliveryConfigSummary {
 export interface ItemDeliveryConfig extends ItemDeliveryConfigSummary {
   configured: boolean;
   variants: ProductVariantBinding[];
+}
+
+export interface ItemSettingTemplate {
+  id: number;
+  user_id: number;
+  name: string;
+  description?: string;
+  payload: Record<string, any>;
+  summary?: {
+    has_delivery: boolean;
+    delivery_variants: number;
+    has_reply: boolean;
+    has_relist: boolean;
+    has_confirmation: boolean;
+  };
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface DeliveryConfirmationSettings {

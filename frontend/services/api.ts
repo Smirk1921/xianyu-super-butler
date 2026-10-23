@@ -4,7 +4,7 @@ import {
   AdminStats, AdminUser, Card, CardShipment, SystemSettings, ApiResponse, OrderAnalytics,
   Item, ItemDeliveryConfig, ItemDeliveryConfigSummary,
   DeliveryConfirmationSettings, ItemDeliveryConfirmationSettings,
-  DeliveryConfirmationRecord,
+  DeliveryConfirmationRecord, ItemSettingTemplate,
   ProductVariantBinding, AIReplySettings, ShippingRule, ReplyRule, DefaultReply,
   ItemReply,
   ItemRelistSetting,
@@ -600,8 +600,42 @@ export const updateItemMultiSpec = async (cookieId: string, itemId: string, enab
 }
 
 export const updateItemMultiQuantity = async (cookieId: string, itemId: string, enabled: boolean): Promise<any> => {
-    return put(`/items/${cookieId}/${itemId}/multi-quantity-delivery`, { multi_quantity_delivery: enabled });
+  return put(`/items/${cookieId}/${itemId}/multi-quantity-delivery`, { multi_quantity_delivery: enabled });
 }
+
+export const updateItemPin = async (cookieId: string, itemId: string, pinned: boolean): Promise<any> => {
+  return put(`/items/${cookieId}/${itemId}/pin`, { pinned });
+}
+
+export const getItemSettingTemplates = async (): Promise<ItemSettingTemplate[]> => {
+  const response = await get<{ items: ItemSettingTemplate[] }>('/item-setting-templates');
+  return response.items || [];
+};
+
+export const createItemSettingTemplateFromItem = async (
+  cookieId: string,
+  itemId: string,
+  name: string,
+  description = '',
+): Promise<ItemSettingTemplate> => {
+  const response = await post<{ template: ItemSettingTemplate }>(
+    '/item-setting-templates/from-item',
+    { cookie_id: cookieId, item_id: itemId, name, description },
+  );
+  return response.template;
+};
+
+export const applyItemSettingTemplate = async (
+  cookieId: string,
+  itemId: string,
+  templateId: number,
+): Promise<any> => {
+  return post(`/items/${cookieId}/${itemId}/apply-template`, { template_id: templateId });
+};
+
+export const deleteItemSettingTemplate = async (templateId: number): Promise<any> => {
+  return del(`/item-setting-templates/${templateId}`);
+};
 
 export const getItemDeliveryConfigs = async (): Promise<ItemDeliveryConfigSummary[]> => {
   const response = await get<{ configs?: ItemDeliveryConfigSummary[] }>('/item-delivery-configs');

@@ -5510,6 +5510,7 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
             data_content=card_data.get('data_content'),
             image_url=card_data.get('image_url'),
             description=card_data.get('description'),
+            description_position=card_data.get('description_position', 'before'),
             enabled=card_data.get('enabled', True),
             delay_seconds=card_data.get('delay_seconds', 0),
             delivery_template=card_data.get('delivery_template'),
@@ -5591,6 +5592,7 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
             data_content=card_data.get('data_content'),
             image_url=card_data.get('image_url'),
             description=card_data.get('description'),
+            description_position=card_data.get('description_position', 'before'),
             enabled=card_data.get('enabled', True),
             delay_seconds=card_data.get('delay_seconds'),
             delivery_template=card_data.get('delivery_template'),
@@ -5618,6 +5620,7 @@ async def update_card_with_image(
     name: str = Form(...),
     type: str = Form(...),
     description: str = Form(default=""),
+    description_position: str = Form(default="before"),
     delay_seconds: int = Form(default=0),
     enabled: bool = Form(default=True),
     is_multi_spec: bool = Form(default=False),
@@ -5659,6 +5662,7 @@ async def update_card_with_image(
             card_type=type,
             image_url=image_url,
             description=description,
+            description_position=description_position,
             enabled=enabled,
             delay_seconds=delay_seconds,
             is_multi_spec=is_multi_spec,
@@ -8482,7 +8486,8 @@ def get_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', "item_replay",
             'risk_control_logs', 'delivery_confirmation_settings',
-            'item_delivery_confirmation_settings', 'delivery_confirmations'
+            'item_delivery_confirmation_settings', 'delivery_confirmations',
+            'item_setting_templates'
         ]
 
         if table_name not in allowed_tables:
@@ -8521,7 +8526,7 @@ def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, A
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders','item_replay',
             'delivery_confirmation_settings', 'item_delivery_confirmation_settings',
-            'delivery_confirmations'
+            'delivery_confirmations', 'item_setting_templates'
         ]
 
         if table_name not in allowed_tables:
@@ -8563,7 +8568,8 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', 'item_replay',
             'risk_control_logs', 'delivery_confirmation_settings',
-            'item_delivery_confirmation_settings', 'delivery_confirmations'
+            'item_delivery_confirmation_settings', 'delivery_confirmations',
+            'item_setting_templates'
         ]
 
         # 不允许清空用户表
@@ -8641,6 +8647,364 @@ def update_item_multi_quantity_delivery(cookie_id: str, item_id: str, delivery_d
 
 
 
+
+
+@app.put("/items/{cookie_id}/{item_id}/pin")
+def update_item_pin(cookie_id: str, item_id: str, pin_data: dict,
+                    current_user: Dict[str, Any] = Depends(get_current_user)):
+    """置顶/取消置顶商品。"""
+    try:
+        from app.db_manager import db_manager
+        if cookie_id not in db_manager.get_all_cookies(current_user['user_id']):
+            raise HTTPException(status_code=403, detail="无权限操作该账号")
+        pinned = bool(pin_data.get('pinned', False))
+        success = db_manager.set_item_pinned(cookie_id, item_id, pinned)
+        if not success:
+            raise HTTPException(status_code=404, detail="商品不存在")
+        return {"message": f"商品已{'置顶' if pinned else '取消置顶'}", "pinned": pinned}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 商品设置模板 ====================
+
+class ItemSettingTemplateFromItemIn(BaseModel):
+    cookie_id: str
+    item_id: str
+    name: str
+    description: Optional[str] = ""
+
+
+class ItemSettingTemplateApplyIn(BaseModel):
+    template_id: int
+
+
+def _build_item_setting_template_payload(
+    cookie_id: str, item_id: str, user_id: int
+) -> Dict[str, Any]:
+    """把商品当前的自动发货/回复/补货/确认配置收集成模板 payload。"""
+    item_info = db_manager.get_item_info(cookie_id, item_id)
+    if not item_info:
+        raise HTTPException(status_code=404, detail="商品不存在")
+
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "item": {
+            "is_multi_spec": bool(item_info.get("is_multi_spec")),
+            "multi_quantity_delivery": bool(item_info.get("multi_quantity_delivery")),
+        },
+    }
+
+    delivery = db_manager.get_item_delivery_config(cookie_id, item_id, user_id)
+    if delivery and delivery.get("variants"):
+        variants = []
+        for variant in delivery["variants"]:
+            if not variant.get("card_id"):
+                continue
+            variants.append({
+                "display_name": variant.get("display_name") or "",
+                "spec_text": variant.get("spec_text") or "",
+                "spec_payload": variant.get("spec_payload") or {},
+                "platform_sku_id": variant.get("platform_sku_id") or "",
+                "card_id": int(variant["card_id"]),
+                "card_name": variant.get("card_name") or "",
+                "delivery_count": max(1, int(variant.get("delivery_count") or 1)),
+                "enabled": bool(variant.get("enabled", True)),
+                "binding_enabled": bool(variant.get("binding_enabled", True)),
+                "source": variant.get("source") or "manual",
+            })
+        if variants:
+            payload["delivery_config"] = {
+                "enabled": bool(delivery.get("enabled")),
+                "is_multi_spec": bool(delivery.get("is_multi_spec")),
+                "variants": variants,
+            }
+
+    item_reply = db_manager.get_item_reply(cookie_id, item_id)
+    if item_reply and str(item_reply.get("reply_content") or "").strip():
+        payload["item_reply"] = {
+            "reply_content": item_reply.get("reply_content") or "",
+            "priority": int(item_reply.get("priority", 1)),
+            "reply_once": int(item_reply.get("reply_once", 1)),
+        }
+
+    relist = db_manager.get_item_relist_setting(user_id, cookie_id, item_id)
+    if relist:
+        payload["relist"] = {
+            "enabled": bool(relist.get("enabled")),
+            "min_stock": max(1, int(relist.get("min_stock") or 1)),
+        }
+
+    confirmation = db_manager.get_item_delivery_confirmation_setting(
+        cookie_id, item_id
+    )
+    if confirmation:
+        payload["confirmation"] = {
+            "use_account_default": bool(confirmation.get("use_account_default")),
+            "enabled": bool(confirmation.get("enabled")),
+            "confirm_text": confirmation.get("confirm_text"),
+            "confirm_keywords": confirmation.get("confirm_keywords"),
+            "exclude_keywords": confirmation.get("exclude_keywords"),
+            "timeout_minutes": confirmation.get("timeout_minutes"),
+            "reminder_minutes": confirmation.get("reminder_minutes"),
+            "max_reminders": confirmation.get("max_reminders"),
+            "reminder_text": confirmation.get("reminder_text"),
+        }
+
+    return payload
+
+
+def _apply_item_setting_template(
+    cookie_id: str, item_id: str, user_id: int, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """把模板应用到目标商品，返回已应用项和警告。"""
+    if not db_manager.get_item_info(cookie_id, item_id):
+        raise HTTPException(status_code=404, detail="商品不存在")
+
+    applied = []
+    warnings = []
+    payload = payload or {}
+
+    delivery = payload.get("delivery_config") or {}
+    if delivery.get("variants"):
+        resolved_variants = []
+        for variant in delivery["variants"]:
+            card_id = int(variant.get("card_id") or 0)
+            card = db_manager.get_card_by_id(card_id, user_id) if card_id else None
+            if not card or not card.get("enabled"):
+                fallback_id = db_manager.find_card_id_by_name(
+                    user_id, variant.get("card_name") or ""
+                )
+                if fallback_id:
+                    card_id = fallback_id
+                    warnings.append(
+                        f"卡密「{variant.get('card_name') or card_id}」ID 已变化，已按名称重新匹配"
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"模板中的卡密「{variant.get('card_name') or card_id}」"
+                            "不存在或已停用，请先恢复卡密"
+                        ),
+                    )
+            resolved_variants.append({
+                "display_name": variant.get("display_name") or "",
+                "spec_text": variant.get("spec_text") or "",
+                "spec_payload": variant.get("spec_payload") or {},
+                "platform_sku_id": variant.get("platform_sku_id") or "",
+                "card_id": card_id,
+                "delivery_count": max(1, int(variant.get("delivery_count") or 1)),
+                "enabled": bool(variant.get("enabled", True)),
+                "binding_enabled": bool(variant.get("binding_enabled", True)),
+                "source": variant.get("source") or "manual",
+            })
+        if delivery.get("is_multi_spec"):
+            warnings.append("多规格模板的规格组合需要与新商品一致，请在应用后检查绑定")
+        db_manager.save_item_delivery_config(
+            user_id=user_id,
+            cookie_id=cookie_id,
+            item_id=item_id,
+            enabled=bool(delivery.get("enabled", True)),
+            is_multi_spec=bool(delivery.get("is_multi_spec")),
+            variants=resolved_variants,
+        )
+        applied.append("自动发货")
+
+    item_reply = payload.get("item_reply") or {}
+    if str(item_reply.get("reply_content") or "").strip():
+        db_manager.update_item_reply(
+            cookie_id,
+            item_id,
+            str(item_reply.get("reply_content") or ""),
+            priority=int(item_reply.get("priority", 1)),
+            reply_once=int(item_reply.get("reply_once", 1)),
+        )
+        applied.append("商品专属回复")
+
+    relist = payload.get("relist") or {}
+    if relist:
+        db_manager.upsert_item_relist_setting(
+            user_id,
+            cookie_id,
+            item_id,
+            enabled=bool(relist.get("enabled")),
+            min_stock=max(1, int(relist.get("min_stock") or 1)),
+        )
+        applied.append("自动补货/重新上架")
+
+    confirmation = payload.get("confirmation") or {}
+    if confirmation:
+        db_manager.save_item_delivery_confirmation_setting(
+            user_id=user_id,
+            cookie_id=cookie_id,
+            item_id=item_id,
+            use_account_default=bool(confirmation.get("use_account_default", True)),
+            enabled=bool(confirmation.get("enabled", True)),
+            confirm_text=confirmation.get("confirm_text"),
+            confirm_keywords=confirmation.get("confirm_keywords"),
+            exclude_keywords=confirmation.get("exclude_keywords"),
+            timeout_minutes=confirmation.get("timeout_minutes"),
+            reminder_minutes=confirmation.get("reminder_minutes"),
+            max_reminders=confirmation.get("max_reminders"),
+            reminder_text=confirmation.get("reminder_text"),
+        )
+        applied.append("付款后确认发货")
+
+    item_options = payload.get("item") or {}
+    if "multi_quantity_delivery" in item_options:
+        db_manager.update_item_multi_quantity_delivery_status(
+            cookie_id, item_id, bool(item_options.get("multi_quantity_delivery"))
+        )
+        applied.append("多数量发货")
+
+    if not applied:
+        raise HTTPException(status_code=400, detail="模板中没有可应用的设置")
+
+    return {
+        "applied": applied,
+        "warnings": warnings,
+        "effective_confirmation": db_manager.get_effective_delivery_confirmation(
+            cookie_id, item_id
+        ),
+    }
+
+
+@app.get("/item-setting-templates")
+def list_item_setting_templates(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """列出当前用户的商品设置模板。"""
+    try:
+        templates = db_manager.list_item_setting_templates(current_user["user_id"])
+        for template in templates:
+            payload = template.get("payload") or {}
+            delivery = payload.get("delivery_config") or {}
+            template["summary"] = {
+                "has_delivery": bool(delivery.get("variants")),
+                "delivery_variants": len(delivery.get("variants") or []),
+                "has_reply": bool((payload.get("item_reply") or {}).get("reply_content")),
+                "has_relist": bool(payload.get("relist")),
+                "has_confirmation": bool(payload.get("confirmation")),
+            }
+        return {"items": templates}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/item-setting-templates/from-item")
+def create_item_setting_template_from_item(
+    payload: ItemSettingTemplateFromItemIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """把指定商品的当前设置保存为模板。"""
+    try:
+        user_id = current_user["user_id"]
+        cookie_id = str(payload.cookie_id or "").strip()
+        item_id = str(payload.item_id or "").strip()
+        name = str(payload.name or "").strip()
+        if not cookie_id or not item_id:
+            raise HTTPException(status_code=400, detail="请选择商品")
+        if not name:
+            raise HTTPException(status_code=400, detail="请填写模板名称")
+        if cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限操作该账号")
+
+        template_payload = _build_item_setting_template_payload(
+            cookie_id, item_id, user_id
+        )
+        meaningful = any(
+            template_payload.get(key)
+            for key in ("delivery_config", "item_reply", "relist", "confirmation")
+        )
+        if not meaningful and not (template_payload.get("item") or {}).get(
+            "multi_quantity_delivery"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="当前商品还没有可保存的发货、回复、补货或确认设置",
+            )
+
+        template_id = db_manager.save_item_setting_template(
+            user_id=user_id,
+            name=name,
+            payload=template_payload,
+            description=payload.description or "",
+        )
+        if not template_id:
+            raise HTTPException(status_code=500, detail="保存模板失败")
+        log_with_user(
+            "info",
+            f"保存商品设置模板: {name} (ID: {template_id}) from {cookie_id}/{item_id}",
+            current_user,
+        )
+        return {
+            "success": True,
+            "id": template_id,
+            "message": "模板已保存",
+            "template": db_manager.get_item_setting_template(user_id, template_id),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/items/{cookie_id}/{item_id}/apply-template")
+def apply_item_setting_template(
+    cookie_id: str,
+    item_id: str,
+    payload: ItemSettingTemplateApplyIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """把模板应用到目标商品。"""
+    try:
+        user_id = current_user["user_id"]
+        if cookie_id not in db_manager.get_all_cookies(user_id):
+            raise HTTPException(status_code=403, detail="无权限操作该账号")
+        template = db_manager.get_item_setting_template(
+            user_id, payload.template_id
+        )
+        if not template:
+            raise HTTPException(status_code=404, detail="模板不存在")
+        result = _apply_item_setting_template(
+            cookie_id, item_id, user_id, template.get("payload") or {}
+        )
+        log_with_user(
+            "info",
+            f"应用商品设置模板: {template.get('name')} -> {cookie_id}/{item_id}",
+            current_user,
+        )
+        return {
+            "success": True,
+            "message": f"已应用：{'、'.join(result['applied'])}",
+            **result,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/item-setting-templates/{template_id}")
+def delete_item_setting_template(
+    template_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """删除模板。"""
+    try:
+        success = db_manager.delete_item_setting_template(
+            current_user["user_id"], template_id
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="模板不存在")
+        return {"success": True, "message": "模板已删除"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== 订单管理接口 ====================

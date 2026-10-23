@@ -237,6 +237,7 @@ class DBManager:
                 data_content TEXT,
                 image_url TEXT,
                 description TEXT,
+                description_position TEXT DEFAULT 'before',
                 enabled BOOLEAN DEFAULT TRUE,
                 delay_seconds INTEGER DEFAULT 0,
                 delivery_template TEXT,
@@ -648,6 +649,7 @@ class DBManager:
                 item_image TEXT,
                 item_detail TEXT,
                 is_multi_spec BOOLEAN DEFAULT FALSE,
+                is_pinned INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE,
@@ -867,6 +869,25 @@ class DBManager:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_item_relist_cookie_enabled
                 ON item_relist_settings(cookie_id, enabled)
+            ''')
+
+            # 商品设置模板：把自动发货、专属回复、自动上架、确认发货等
+            # 商品级配置保存成可复用模板，上架新商品后一键套用。
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS item_setting_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    payload TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, name)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_item_setting_templates_user
+                ON item_setting_templates(user_id, updated_at DESC)
             ''')
 
             # 付款后确认发货：账号级默认配置、商品级覆盖、每订单确认状态。
@@ -1173,6 +1194,7 @@ class DBManager:
                 'delivery_template': "TEXT",
                 'delivery_template_enabled': "BOOLEAN DEFAULT FALSE",
                 'delivery_template_images': "TEXT",
+                'description_position': "TEXT DEFAULT 'before'",
             }
             for column_name, column_type in delivery_template_columns.items():
                 if column_name not in card_columns:
@@ -1625,6 +1647,13 @@ class DBManager:
                     # 默认开启，理由同建表处：默认关闭会让多件订单只发一份
                     self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN multi_quantity_delivery BOOLEAN DEFAULT TRUE")
                     logger.info("为item_info表添加多数量发货字段")
+
+                # 为item_info表添加商品置顶字段（如果不存在）
+                try:
+                    self._execute_sql(cursor, "SELECT is_pinned FROM item_info LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN is_pinned INTEGER DEFAULT 0")
+                    logger.info("为item_info表添加商品置顶字段")
 
                 # 检查orders表是否有is_bargain字段
                 try:
@@ -4099,6 +4128,18 @@ class DBManager:
                                 'columns': columns,
                                 'rows': [list(row) for row in rows]
                             }
+
+                    # 商品设置模板只按 user_id 关联，不依赖 cookie_id
+                    cursor.execute(
+                        "SELECT * FROM item_setting_templates WHERE user_id = ?",
+                        (user_id,),
+                    )
+                    columns = [description[0] for description in cursor.description]
+                    rows = cursor.fetchall()
+                    backup_data['data']['item_setting_templates'] = {
+                        'columns': columns,
+                        'rows': [list(row) for row in rows]
+                    }
                 else:
                     # 系统级备份：备份所有数据
                     tables = [
@@ -4108,7 +4149,8 @@ class DBManager:
                         'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
                         'delivery_confirmation_settings',
                         'item_delivery_confirmation_settings',
-                        'delivery_confirmations'
+                        'delivery_confirmations',
+                        'item_setting_templates'
                     ]
 
                     for table in tables:
@@ -4145,6 +4187,11 @@ class DBManager:
                     # 获取用户的cookie_id列表
                     self._execute_sql(cursor, "SELECT id FROM cookies WHERE user_id = ?", (user_id,))
                     user_cookie_ids = [row[0] for row in cursor.fetchall()]
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM item_setting_templates WHERE user_id = ?",
+                        (user_id,),
+                    )
 
                     if user_cookie_ids:
                         placeholders = ','.join(['?' for _ in user_cookie_ids])
@@ -4169,7 +4216,8 @@ class DBManager:
                         'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies',
                         'delivery_confirmation_settings',
                         'item_delivery_confirmation_settings',
-                        'delivery_confirmations'
+                        'delivery_confirmations',
+                        'item_setting_templates'
                     ]
 
                     for table in tables:
@@ -4187,7 +4235,8 @@ class DBManager:
                                         'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
                                         'delivery_confirmation_settings',
                                         'item_delivery_confirmation_settings',
-                                        'delivery_confirmations']:
+                                        'delivery_confirmations',
+                                        'item_setting_templates']:
                         continue
 
                     columns = table_data['columns']
@@ -4197,8 +4246,8 @@ class DBManager:
                         continue
 
                     # 如果是用户级导入，需要确保cookies表的user_id正确
-                    if user_id is not None and table_name == 'cookies':
-                        # 更新所有导入的cookies的user_id
+                    if user_id is not None and table_name in ('cookies', 'item_setting_templates'):
+                        # 更新所有导入的用户级数据的 user_id
                         updated_rows = []
                         for row in rows:
                             row_dict = dict(zip(columns, row))
@@ -4840,7 +4889,7 @@ class DBManager:
                    delivery_template: str = None, delivery_template_enabled: bool = False,
                    delivery_template_images=None,
                    is_multi_spec: bool = False, spec_name: str = None, spec_value: str = None,
-                   user_id: int = None):
+                   user_id: int = None, description_position: str = 'before'):
         """创建新卡券（支持多规格）"""
         with self.lock:
             try:
@@ -4883,12 +4932,15 @@ class DBManager:
 
                 cursor.execute('''
                 INSERT INTO cards (name, type, api_config, text_content, data_content, image_url,
-                                 description, enabled, delay_seconds, delivery_template,
-                                 delivery_template_enabled, delivery_template_images,
-                                 is_multi_spec, spec_name, spec_value, user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 description, description_position, enabled, delay_seconds,
+                                 delivery_template, delivery_template_enabled,
+                                 delivery_template_images, is_multi_spec, spec_name, spec_value,
+                                 user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (name, card_type, api_config_str, text_content, data_content, image_url,
-                      description, enabled, delay_seconds, delivery_template,
+                      description,
+                      'after' if str(description_position or '').lower() == 'after' else 'before',
+                      enabled, delay_seconds, delivery_template,
                       bool(delivery_template_enabled),
                       self._serialize_delivery_template_images(delivery_template_images),
                       is_multi_spec, spec_name, spec_value, user_id))
@@ -4914,7 +4966,8 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, is_multi_spec,
                            spec_name, spec_value, created_at, updated_at,
-                           delivery_template, delivery_template_enabled, delivery_template_images
+                           delivery_template, delivery_template_enabled, delivery_template_images,
+                           description_position
                     FROM cards
                     WHERE user_id = ?
                     ORDER BY created_at DESC
@@ -4924,7 +4977,8 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, is_multi_spec,
                            spec_name, spec_value, created_at, updated_at,
-                           delivery_template, delivery_template_enabled, delivery_template_images
+                           delivery_template, delivery_template_enabled, delivery_template_images,
+                           description_position
                     FROM cards
                     ORDER BY created_at DESC
                     ''')
@@ -4959,7 +5013,10 @@ class DBManager:
                         'updated_at': row[14],
                         'delivery_template': row[15],
                         'delivery_template_enabled': bool(row[16]) if row[16] is not None else False,
-                        'delivery_template_images': self._parse_delivery_template_images(row[17])
+                        'delivery_template_images': self._parse_delivery_template_images(row[17]),
+                        'description_position': (
+                            row[18] if len(row) > 18 and row[18] else 'before'
+                        ),
                     })
 
                 return cards
@@ -4977,7 +5034,8 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, is_multi_spec,
                            spec_name, spec_value, created_at, updated_at,
-                           delivery_template, delivery_template_enabled, delivery_template_images
+                           delivery_template, delivery_template_enabled, delivery_template_images,
+                           description_position
                     FROM cards WHERE id = ? AND user_id = ?
                     ''', (card_id, user_id))
                 else:
@@ -4985,7 +5043,8 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, is_multi_spec,
                            spec_name, spec_value, created_at, updated_at,
-                           delivery_template, delivery_template_enabled, delivery_template_images
+                           delivery_template, delivery_template_enabled, delivery_template_images,
+                           description_position
                     FROM cards WHERE id = ?
                     ''', (card_id,))
 
@@ -5019,7 +5078,10 @@ class DBManager:
                         'updated_at': row[14],
                         'delivery_template': row[15],
                         'delivery_template_enabled': bool(row[16]) if row[16] is not None else False,
-                        'delivery_template_images': self._parse_delivery_template_images(row[17])
+                        'delivery_template_images': self._parse_delivery_template_images(row[17]),
+                        'description_position': (
+                            row[18] if len(row) > 18 and row[18] else 'before'
+                        ),
                     }
                 return None
             except Exception as e:
@@ -5032,7 +5094,7 @@ class DBManager:
                    delay_seconds: int = None, is_multi_spec: bool = None, spec_name: str = None,
                    spec_value: str = None, user_id: int = None,
                    delivery_template: str = None, delivery_template_enabled: bool = None,
-                   delivery_template_images=None):
+                   delivery_template_images=None, description_position: str = None):
         """更新卡券（支持用户隔离）"""
         with self.lock:
             try:
@@ -5075,6 +5137,11 @@ class DBManager:
                 if description is not None:
                     update_fields.append("description = ?")
                     params.append(description)
+                if description_position is not None:
+                    update_fields.append("description_position = ?")
+                    params.append(
+                        'after' if str(description_position).lower() == 'after' else 'before'
+                    )
                 if enabled is not None:
                     update_fields.append("enabled = ?")
                     params.append(enabled)
@@ -5251,7 +5318,7 @@ class DBManager:
                        c.delay_seconds as card_delay_seconds,
                        c.is_multi_spec, c.spec_name, c.spec_value,
                        c.delivery_template, c.delivery_template_enabled,
-                       c.delivery_template_images
+                       c.delivery_template_images, c.description_position
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
@@ -5298,7 +5365,10 @@ class DBManager:
                         'spec_value': row[18],
                         'card_delivery_template': row[19],
                         'card_delivery_template_enabled': bool(row[20]) if row[20] is not None else False,
-                        'card_delivery_template_images': self._parse_delivery_template_images(row[21])
+                        'card_delivery_template_images': self._parse_delivery_template_images(row[21]),
+                        'card_description_position': (
+                            row[22] if len(row) > 22 and row[22] else 'before'
+                        ),
                     })
 
                 return rules
@@ -5332,7 +5402,7 @@ class DBManager:
                                ELSE 2
                            END AS scope_rank,
                            c.delivery_template, c.delivery_template_enabled,
-                           c.delivery_template_images
+                           c.delivery_template_images, c.description_position
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
@@ -5404,6 +5474,9 @@ class DBManager:
                         'card_delivery_template': row[22],
                         'card_delivery_template_enabled': bool(row[23]) if row[23] is not None else False,
                         'card_delivery_template_images': self._parse_delivery_template_images(row[24]),
+                        'card_description_position': (
+                            row[25] if len(row) > 25 and row[25] else 'before'
+                        ),
                     })
                 return rules
             except Exception as e:
@@ -5548,7 +5621,7 @@ class DBManager:
                            c.description as card_description, c.delay_seconds as card_delay_seconds,
                            c.is_multi_spec, c.spec_name, c.spec_value,
                            c.delivery_template, c.delivery_template_enabled,
-                           c.delivery_template_images
+                           c.delivery_template_images, c.description_position
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
@@ -5595,7 +5668,10 @@ class DBManager:
                             'spec_value': row[17],
                             'card_delivery_template': row[18],
                             'card_delivery_template_enabled': bool(row[19]) if row[19] is not None else False,
-                            'card_delivery_template_images': self._parse_delivery_template_images(row[20])
+                            'card_delivery_template_images': self._parse_delivery_template_images(row[20]),
+                            'card_description_position': (
+                                row[21] if len(row) > 21 and row[21] else 'before'
+                            ),
                         })
 
                     if rules:
@@ -5611,7 +5687,7 @@ class DBManager:
                        c.description as card_description, c.delay_seconds as card_delay_seconds,
                        c.is_multi_spec, c.spec_name, c.spec_value,
                        c.delivery_template, c.delivery_template_enabled,
-                       c.delivery_template_images
+                       c.delivery_template_images, c.description_position
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
@@ -6242,6 +6318,26 @@ class DBManager:
             self.conn.rollback()
             return False
 
+    def set_item_pinned(self, cookie_id: str, item_id: str, pinned: bool) -> bool:
+        """设置商品是否置顶。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE item_info
+                    SET is_pinned = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE cookie_id = ? AND item_id = ?
+                ''', (1 if pinned else 0, cookie_id, item_id))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"设置商品置顶失败: {e}")
+            return False
+
     def get_item_multi_quantity_delivery_status(self, cookie_id: str, item_id: str) -> bool:
         """获取商品的多数量发货状态"""
         try:
@@ -6628,7 +6724,7 @@ class DBManager:
                        c.data_content, c.image_url, c.enabled, c.description,
                        c.delay_seconds, pv.enabled,
                        c.delivery_template, c.delivery_template_enabled,
-                       c.delivery_template_images
+                       c.delivery_template_images, c.description_position
                 FROM product_variants pv
                 LEFT JOIN variant_delivery_bindings vdb
                   ON vdb.variant_id = pv.id
@@ -6700,6 +6796,9 @@ class DBManager:
                 "card_delivery_template": row[20],
                 "card_delivery_template_enabled": bool(row[21]) if row[21] is not None else False,
                 "card_delivery_template_images": self._parse_delivery_template_images(row[22]),
+                "card_description_position": (
+                    row[23] if len(row) > 23 and row[23] else 'before'
+                ),
                 "is_multi_spec": bool(config[3]),
                 "spec_name": "规格组合" if bool(config[3]) else None,
                 "spec_value": specification_text(payload) if bool(config[3]) else None,
@@ -7452,6 +7551,7 @@ class DBManager:
                 cursor.execute('DELETE FROM delivery_confirmations WHERE user_id = ?', (user_id,))
                 cursor.execute('DELETE FROM item_delivery_confirmation_settings WHERE user_id = ?', (user_id,))
                 cursor.execute('DELETE FROM delivery_confirmation_settings WHERE user_id = ?', (user_id,))
+                cursor.execute('DELETE FROM item_setting_templates WHERE user_id = ?', (user_id,))
 
                 # 5. 删除用户的Cookie
                 cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
@@ -8984,6 +9084,125 @@ class DBManager:
                 pass
             logger.error(f"取消订单确认记录失败: {e}")
             return 0
+
+    # ==================== 商品设置模板 ====================
+
+    def find_card_id_by_name(self, user_id: int, card_name: str) -> Optional[int]:
+        """模板应用时按卡密名称兜底查找，兼容卡密被重建 ID 变化。"""
+        name = str(card_name or "").strip()
+        if not name:
+            return None
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT id FROM cards
+                    WHERE user_id = ? AND name = ? AND enabled = 1
+                    ORDER BY id DESC LIMIT 1
+                ''', (int(user_id), name))
+                row = cursor.fetchone()
+                return int(row[0]) if row else None
+        except Exception as e:
+            logger.error(f"按名称查找卡密失败: {e}")
+            return None
+
+    def save_item_setting_template(self, user_id: int, name: str,
+                                   payload: Dict[str, Any],
+                                   description: str = "") -> Optional[int]:
+        """按名称保存/覆盖商品设置模板，返回模板 ID。"""
+        template_name = str(name or "").strip()
+        if not template_name:
+            return None
+        try:
+            payload_text = json.dumps(payload or {}, ensure_ascii=False)
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO item_setting_templates
+                        (user_id, name, description, payload, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id, name) DO UPDATE SET
+                        description = excluded.description,
+                        payload = excluded.payload,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (int(user_id), template_name, str(description or ""), payload_text))
+                self.conn.commit()
+                cursor.execute('''
+                    SELECT id FROM item_setting_templates
+                    WHERE user_id = ? AND name = ?
+                ''', (int(user_id), template_name))
+                row = cursor.fetchone()
+                return int(row[0]) if row else None
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"保存商品设置模板失败: {e}")
+            return None
+
+    @staticmethod
+    def _parse_item_setting_template_row(row, columns) -> Dict[str, Any]:
+        item = dict(zip(columns, row))
+        try:
+            item['payload'] = json.loads(item.get('payload') or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item['payload'] = {}
+        return item
+
+    def list_item_setting_templates(self, user_id: int) -> List[Dict[str, Any]]:
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM item_setting_templates
+                    WHERE user_id = ?
+                    ORDER BY updated_at DESC, id DESC
+                ''', (int(user_id),))
+                columns = [description[0] for description in cursor.description]
+                return [
+                    self._parse_item_setting_template_row(row, columns)
+                    for row in cursor.fetchall()
+                ]
+        except Exception as e:
+            logger.error(f"读取商品设置模板失败: {e}")
+            return []
+
+    def get_item_setting_template(self, user_id: int,
+                                  template_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM item_setting_templates
+                    WHERE user_id = ? AND id = ?
+                ''', (int(user_id), int(template_id)))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                columns = [description[0] for description in cursor.description]
+                return self._parse_item_setting_template_row(row, columns)
+        except Exception as e:
+            logger.error(f"读取商品设置模板失败: {e}")
+            return None
+
+    def delete_item_setting_template(self, user_id: int, template_id: int) -> bool:
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    DELETE FROM item_setting_templates
+                    WHERE user_id = ? AND id = ?
+                ''', (int(user_id), int(template_id)))
+                self.conn.commit()
+                return (cursor.rowcount or 0) > 0
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"删除商品设置模板失败: {e}")
+            return False
 
     # ==================== 商品自动重新上架 ====================
 

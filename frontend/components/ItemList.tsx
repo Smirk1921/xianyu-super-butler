@@ -2,11 +2,14 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Box,
+  ClipboardList,
   Edit,
   Loader2,
   ListChecks,
   MessageSquare,
   PackageCheck,
+  Pin,
+  PinOff,
   Plus,
   RefreshCw,
   Save,
@@ -25,6 +28,7 @@ import {
   ItemDeliveryConfirmationSettings,
   ItemReply,
   ItemRelistSetting,
+  ItemSettingTemplate,
   ShippingRule,
 } from '../types';
 import {
@@ -41,15 +45,20 @@ import {
   getItemReply,
   getItemReplies,
   getItemRelistSettings,
+  getItemSettingTemplates,
   getItems,
   getShippingRules,
   saveItemDeliveryConfig,
+  createItemSettingTemplateFromItem,
+  applyItemSettingTemplate,
+  deleteItemSettingTemplate,
   updateItemDeliveryConfirmation,
   polishItems,
   runItemRelist,
   syncItemsFromAccount,
   updateItemDetail,
   updateItemMultiQuantity,
+  updateItemPin,
   updateItemRelistSetting,
   updateItemReply,
   updateShippingRule,
@@ -265,6 +274,18 @@ const ItemList: React.FC = () => {
     reminderText: '',
   });
 
+  // 商品设置模板
+  const [settingTemplates, setSettingTemplates] = useState<ItemSettingTemplate[]>([]);
+  const [templateItem, setTemplateItem] = useState<Item | null>(null);
+  const [templateName, setTemplateName] = useState('');
+  const [templateDescription, setTemplateDescription] = useState('');
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [templateLoading, setTemplateLoading] = useState(false);
+  const [templateSaving, setTemplateSaving] = useState(false);
+  const selectedTemplate = settingTemplates.find(
+    template => String(template.id) === selectedTemplateId,
+  ) || null;
+
   const accountNames = useMemo(
     () => new Map(accounts.map(account => [
       account.id,
@@ -304,8 +325,10 @@ const ItemList: React.FC = () => {
   // 下架商品默认藏起来：它们和在售的混在一起会让人误以为还能卖，
   // 但不能直接删 —— 专属发货配置挂在商品上，重新上架还要接着用。
   const [showOffShelf, setShowOffShelf] = useState(false);
+  const [showPinnedOnly, setShowPinnedOnly] = useState(false);
 
   const isOffShelf = (item: Item) => item.listing_status === 'off_shelf';
+  const isPinned = (item: Item) => Boolean(item.is_pinned);
 
   const accountScopedItems = useMemo(
     () => (listAccountFilter ? items.filter(item => item.cookie_id === listAccountFilter) : items),
@@ -317,10 +340,21 @@ const ItemList: React.FC = () => {
     [accountScopedItems],
   );
 
-  const visibleItems = useMemo(
-    () => (showOffShelf ? accountScopedItems : accountScopedItems.filter(item => !isOffShelf(item))),
-    [accountScopedItems, showOffShelf],
+  const pinnedCount = useMemo(
+    () => accountScopedItems.filter(isPinned).length,
+    [accountScopedItems],
   );
+
+  const visibleItems = useMemo(() => {
+    let scoped = showOffShelf
+      ? accountScopedItems
+      : accountScopedItems.filter(item => !isOffShelf(item));
+    if (showPinnedOnly) {
+      scoped = scoped.filter(isPinned);
+    }
+    // 置顶商品始终排在前面；同组内保持后端原有顺序
+    return [...scoped].sort((left, right) => Number(isPinned(right)) - Number(isPinned(left)));
+  }, [accountScopedItems, showOffShelf, showPinnedOnly]);
 
   // 商品数据由后端一次性返回，这里做客户端分页：商品多时一屏几十行难以浏览
   const totalPages = Math.max(1, Math.ceil(visibleItems.length / pageSize));
@@ -349,19 +383,21 @@ const ItemList: React.FC = () => {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [accountData, itemData, cardData, ruleData, configData, confirmationData] = await Promise.all([
+      const [accountData, itemData, cardData, ruleData, configData, confirmationData, templateData] = await Promise.all([
         getAccountDetails(),
         getItems(),
         getCards(),
         getShippingRules(),
         getItemDeliveryConfigs(),
         getItemDeliveryConfirmations().catch(() => [] as ItemDeliveryConfirmationSettings[]),
+        getItemSettingTemplates().catch(() => [] as ItemSettingTemplate[]),
       ]);
       setAccounts(accountData);
       setItems(itemData);
       setCards(cardData);
       setShippingRules(ruleData);
       setDeliveryConfigs(configData);
+      setSettingTemplates(templateData);
 
       const confirmationMap: Record<string, ItemDeliveryConfirmationSettings> = {};
       confirmationData.forEach(setting => {
@@ -615,6 +651,26 @@ const ItemList: React.FC = () => {
     }
   };
 
+  const togglePin = async (item: Item) => {
+    const next = !isPinned(item);
+    setSavingKey(itemKey(item));
+    try {
+      await updateItemPin(item.cookie_id, item.item_id, next);
+      setItems(current => current.map(currentItem =>
+        itemKey(currentItem) === itemKey(item)
+          ? { ...currentItem, is_pinned: next ? 1 : 0 }
+          : currentItem,
+      ));
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error instanceof Error ? error.message : '置顶操作失败',
+      });
+    } finally {
+      setSavingKey('');
+    }
+  };
+
   const toggleAutoRelist = async (item: Item) => {
     const key = itemKey(item);
     const current = relistSettings[key];
@@ -738,6 +794,101 @@ const ItemList: React.FC = () => {
       });
     } finally {
       setConfirmationSaving(false);
+    }
+  };
+
+  const openTemplateModal = async (item: Item) => {
+    setTemplateItem(item);
+    setTemplateName(`${item.item_title || item.item_id} 模板`);
+    setTemplateDescription('');
+    setSelectedTemplateId('');
+    setTemplateLoading(true);
+    try {
+      setSettingTemplates(await getItemSettingTemplates());
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error instanceof Error ? error.message : '模板加载失败',
+      });
+    } finally {
+      setTemplateLoading(false);
+    }
+  };
+
+  const handleSaveAsTemplate = async () => {
+    if (!templateItem) return;
+    const name = templateName.trim();
+    if (!name) {
+      setNotice({ type: 'error', message: '请填写模板名称' });
+      return;
+    }
+    setTemplateSaving(true);
+    try {
+      await createItemSettingTemplateFromItem(
+        templateItem.cookie_id,
+        templateItem.item_id,
+        name,
+        templateDescription.trim(),
+      );
+      setSettingTemplates(await getItemSettingTemplates());
+      setNotice({ type: 'success', message: '当前商品设置已保存为模板' });
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error instanceof Error ? error.message : '保存模板失败',
+      });
+    } finally {
+      setTemplateSaving(false);
+    }
+  };
+
+  const handleApplyTemplate = async () => {
+    if (!templateItem) return;
+    if (!selectedTemplateId) {
+      setNotice({ type: 'error', message: '请先选择一个模板' });
+      return;
+    }
+    setTemplateSaving(true);
+    try {
+      const result = await applyItemSettingTemplate(
+        templateItem.cookie_id,
+        templateItem.item_id,
+        Number(selectedTemplateId),
+      );
+      const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
+      setNotice({
+        type: warnings.length ? 'error' : 'success',
+        message: `${result?.message || '模板已应用'}${warnings.length ? `；${warnings.join('；')}` : ''}`,
+      });
+      setTemplateItem(null);
+      await loadData();
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error instanceof Error ? error.message : '应用模板失败',
+      });
+    } finally {
+      setTemplateSaving(false);
+    }
+  };
+
+  const handleDeleteTemplate = async (template: ItemSettingTemplate) => {
+    if (!await confirmAction(`确认删除模板“${template.name}”吗？`)) return;
+    setTemplateSaving(true);
+    try {
+      await deleteItemSettingTemplate(template.id);
+      setSettingTemplates(await getItemSettingTemplates());
+      if (selectedTemplateId === String(template.id)) {
+        setSelectedTemplateId('');
+      }
+      setNotice({ type: 'success', message: '模板已删除' });
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error instanceof Error ? error.message : '删除模板失败',
+      });
+    } finally {
+      setTemplateSaving(false);
     }
   };
 
@@ -1035,6 +1186,19 @@ const ItemList: React.FC = () => {
                   显示已下架（{offShelfCount}）
                 </label>
               )}
+              <label className={`flex items-center gap-1.5 text-xs text-gray-500 ${pinnedCount === 0 ? 'opacity-50' : 'cursor-pointer'}`}>
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5 accent-brand-500"
+                  checked={showPinnedOnly}
+                  disabled={pinnedCount === 0}
+                  onChange={event => {
+                    setShowPinnedOnly(event.target.checked);
+                    setPage(1);
+                  }}
+                />
+                只看置顶（{pinnedCount}）
+              </label>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -1130,6 +1294,11 @@ const ItemList: React.FC = () => {
                             }`}>
                               {item.item_title || '未命名商品'}
                             </h3>
+                            {isPinned(item) && (
+                              <span className="status-badge shrink-0 bg-amber-100 text-amber-700">
+                                置顶
+                              </span>
+                            )}
                             {isOffShelf(item) && (
                               <span
                                 className="status-badge shrink-0 bg-gray-100 text-gray-500"
@@ -1275,6 +1444,30 @@ const ItemList: React.FC = () => {
 
                       <div className="flex items-center justify-end gap-1 border-t border-gray-100 pt-3 xl:!flex-row xl:items-center xl:justify-end xl:border-0 xl:pt-0">
                         <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => void openTemplateModal(item)}
+                            disabled={busy}
+                            className="rounded-md p-2 text-indigo-600 hover:bg-indigo-50"
+                            title="商品设置模板"
+                            aria-label="商品设置模板"
+                          >
+                            <ClipboardList className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void togglePin(item)}
+                            disabled={busy}
+                            className={`rounded-md p-2 ${
+                              isPinned(item)
+                                ? 'text-amber-600 hover:bg-amber-50'
+                                : 'text-gray-400 hover:bg-gray-100'
+                            }`}
+                            title={isPinned(item) ? '取消置顶' : '置顶商品'}
+                            aria-label={isPinned(item) ? '取消置顶' : '置顶商品'}
+                          >
+                            {isPinned(item) ? <Pin className="h-4 w-4" /> : <PinOff className="h-4 w-4" />}
+                          </button>
                           {isOffShelf(item) && (
                             <button
                               type="button"
@@ -1422,6 +1615,173 @@ const ItemList: React.FC = () => {
           onSelectedAccountChange={setSelectedAccount}
         />
       </section>
+
+      {templateItem && createPortal(
+        <div className="modal-overlay">
+          <div className="modal-container" style={{maxWidth: '680px'}}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900">
+                  <ClipboardList className="h-5 w-5 text-indigo-600" />
+                  商品设置模板
+                </h3>
+                <p className="mt-1 line-clamp-1 text-sm text-gray-500">
+                  {templateItem.item_title || templateItem.item_id}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTemplateItem(null)}
+                className="rounded-md p-2 hover:bg-gray-100"
+                aria-label="关闭商品设置模板"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="modal-body space-y-6">
+              {templateLoading ? (
+                <div className="flex items-center justify-center gap-2 py-10 text-sm text-gray-500">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  加载模板中...
+                </div>
+              ) : (
+                <>
+                  <section className="space-y-3 rounded-md border border-indigo-100 bg-indigo-50/50 p-4">
+                    <div>
+                      <h4 className="font-bold text-gray-900">应用到当前商品</h4>
+                      <p className="mt-1 text-xs text-gray-500">
+                        套用自动发货、专属回复、自动补货和付款后确认设置。同名卡密 ID 变化时会按名称重新匹配。
+                      </p>
+                    </div>
+                    <select
+                      value={selectedTemplateId}
+                      onChange={event => setSelectedTemplateId(event.target.value)}
+                      className="ios-input w-full rounded-md px-3 py-2.5"
+                    >
+                      <option value="">选择模板...</option>
+                      {settingTemplates.map(template => (
+                        <option key={template.id} value={template.id}>
+                          {template.name}
+                        </option>
+                      ))}
+                    </select>
+                    {selectedTemplate?.summary && (
+                      <div className="flex flex-wrap gap-2 text-xs">
+                        {selectedTemplate.summary.has_delivery && (
+                          <span className="rounded bg-white px-2 py-1 font-semibold text-indigo-700">
+                            自动发货 {selectedTemplate.summary.delivery_variants} 个规格
+                          </span>
+                        )}
+                        {selectedTemplate.summary.has_reply && (
+                          <span className="rounded bg-white px-2 py-1 font-semibold text-blue-700">
+                            专属回复
+                          </span>
+                        )}
+                        {selectedTemplate.summary.has_relist && (
+                          <span className="rounded bg-white px-2 py-1 font-semibold text-green-700">
+                            自动补货
+                          </span>
+                        )}
+                        {selectedTemplate.summary.has_confirmation && (
+                          <span className="rounded bg-white px-2 py-1 font-semibold text-amber-700">
+                            付款后确认
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => void handleApplyTemplate()}
+                      disabled={templateSaving || !selectedTemplateId}
+                      className="ios-btn-primary flex w-full items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm disabled:opacity-50"
+                    >
+                      {templateSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ClipboardList className="h-4 w-4" />}
+                      {templateSaving ? '处理中...' : '应用模板'}
+                    </button>
+                  </section>
+
+                  <section className="space-y-3 border-t border-gray-200 pt-5">
+                    <div>
+                      <h4 className="font-bold text-gray-900">把当前商品设置保存为模板</h4>
+                      <p className="mt-1 text-xs text-gray-500">
+                        会保存当前商品的自动发货、专属回复、自动补货和付款后确认配置。
+                      </p>
+                    </div>
+                    <input
+                      type="text"
+                      value={templateName}
+                      onChange={event => setTemplateName(event.target.value)}
+                      placeholder="模板名称，例如：4000分号标准配置"
+                      className="ios-input w-full rounded-md px-3 py-2.5"
+                    />
+                    <input
+                      type="text"
+                      value={templateDescription}
+                      onChange={event => setTemplateDescription(event.target.value)}
+                      placeholder="备注（可选）"
+                      className="ios-input w-full rounded-md px-3 py-2.5"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveAsTemplate()}
+                      disabled={templateSaving}
+                      className="ios-btn-secondary flex w-full items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm"
+                    >
+                      {templateSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                      {templateSaving ? '保存中...' : '保存为模板'}
+                    </button>
+                  </section>
+
+                  <section className="border-t border-gray-200 pt-5">
+                    <h4 className="mb-3 font-bold text-gray-900">已有模板</h4>
+                    {settingTemplates.length === 0 ? (
+                      <p className="text-sm text-gray-500">还没有模板，先把当前商品设置保存为模板。</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {settingTemplates.map(template => (
+                          <div
+                            key={template.id}
+                            className="flex items-center justify-between gap-3 rounded-md border border-gray-200 px-3 py-2"
+                          >
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-semibold text-gray-800">{template.name}</p>
+                              <p className="truncate text-xs text-gray-500">
+                                {template.description || '无备注'}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void handleDeleteTemplate(template)}
+                              disabled={templateSaving}
+                              className="shrink-0 rounded-md p-2 text-red-500 hover:bg-red-50 disabled:opacity-50"
+                              title="删除模板"
+                              aria-label="删除模板"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                </>
+              )}
+            </div>
+
+            <div className="modal-footer">
+              <button
+                type="button"
+                onClick={() => setTemplateItem(null)}
+                className="ios-btn-secondary w-full rounded-md px-4 py-2.5 text-sm"
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
 
       {confirmationItem && createPortal(
         <div className="modal-overlay">

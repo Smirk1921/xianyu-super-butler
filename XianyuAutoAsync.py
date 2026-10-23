@@ -7469,7 +7469,11 @@ class XianyuLive:
 
                 if delivery_content:
                     # 处理备注信息和变量替换
-                    final_content = self._process_delivery_content_with_description(delivery_content, rule.get('card_description', ''))
+                    final_content = self._process_delivery_content_with_description(
+                        delivery_content,
+                        rule.get('card_description', ''),
+                        rule.get('card_description_position', 'before'),
+                    )
 
                     # 增加对应规则或商品规格绑定的发货次数统计。
                     if rule.get("rule_kind") == "variant_binding":
@@ -7494,8 +7498,13 @@ class XianyuLive:
 
 
 
-    def _process_delivery_content_with_description(self, delivery_content: str, card_description: str) -> str:
-        """处理发货内容和备注信息，实现变量替换"""
+    def _process_delivery_content_with_description(
+        self,
+        delivery_content: str,
+        card_description: str,
+        description_position: str = 'before',
+    ) -> str:
+        """处理发货内容和备注信息，支持备注放在卡密前或后。"""
         try:
             # 如果是图片发送标记，不进行备注处理，直接返回
             if delivery_content.startswith("__IMAGE_SEND__"):
@@ -7508,12 +7517,14 @@ class XianyuLive:
             # 替换备注中的变量
             processed_description = card_description.replace('{DELIVERY_CONTENT}', delivery_content)
 
-            # 如果备注中包含变量替换，返回处理后的备注
+            # 显式使用占位符时，由占位符位置决定，忽略前置/后置开关
             if '{DELIVERY_CONTENT}' in card_description:
                 return processed_description
-            else:
-                # 如果备注中没有变量，将备注和发货内容组合
-                return f"{processed_description}\n\n{delivery_content}"
+
+            position = str(description_position or 'before').strip().lower()
+            if position == 'after':
+                return f"{delivery_content}\n\n{processed_description}"
+            return f"{processed_description}\n\n{delivery_content}"
 
         except Exception as e:
             logger.error(f"处理备注信息失败: {e}")
