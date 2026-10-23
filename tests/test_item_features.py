@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.db_manager import DBManager
 from XianyuAutoAsync import XianyuLive
@@ -173,6 +173,81 @@ class ItemFeatureTests(unittest.TestCase):
         self.assertTrue(
             self.manager.get_item_multi_quantity_delivery_status("acc", "item-2")
         )
+
+
+class PurchaseFirstMessageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manager = DBManager(os.path.join(self.temp_dir.name, "first-message.db"))
+        self.user_id = self.manager.conn.execute(
+            "SELECT id FROM users WHERE username='admin'"
+        ).fetchone()[0]
+        self.manager.conn.execute(
+            "INSERT INTO cookies (id, value, user_id) VALUES ('acc', 'cookie', ?)",
+            (self.user_id,),
+        )
+        self.manager.conn.execute(
+            "INSERT INTO item_info (cookie_id, item_id, item_title) "
+            "VALUES ('acc', 'item-1', '测试商品')"
+        )
+        self.manager.conn.execute(
+            "INSERT INTO item_info (cookie_id, item_id, item_title) "
+            "VALUES ('acc', 'item-2', '默认回复商品')"
+        )
+        self.manager.conn.commit()
+        self.instance = object.__new__(XianyuLive)
+        self.instance.cookie_id = "acc"
+        self.instance.ws = None
+        self.instance.send_msg = AsyncMock()
+        self.instance.send_im_text = AsyncMock()
+        self.instance.send_image_msg = AsyncMock()
+        self.instance._remember_bot_reply = Mock()
+        self.instance._safe_str = lambda error: str(error)
+
+    def tearDown(self):
+        self.manager.close()
+        self.temp_dir.cleanup()
+
+    async def test_item_first_message_sent_once_before_delivery(self):
+        self.manager.update_item_reply(
+            "acc", "item-1", "你好 {send_user_name}", priority=1, reply_once=1
+        )
+        import XianyuAutoAsync as xa
+        with patch.object(xa, "db_manager", self.manager), patch.object(
+            xa, "AUTO_REPLY", {"enabled": True}
+        ):
+            sent = await self.instance._send_purchase_first_message(
+                object(), {}, "买家", "buyer-1", "item-1", "chat-1", "now"
+            )
+            self.assertTrue(sent)
+            self.instance.send_msg.assert_awaited_once()
+            self.assertEqual(
+                self.instance.send_msg.await_args.args[3], "你好 买家"
+            )
+
+            # reply_once=1：同一会话第二次付款不再重复问候
+            sent_again = await self.instance._send_purchase_first_message(
+                object(), {}, "买家", "buyer-1", "item-1", "chat-1", "now"
+            )
+            self.assertFalse(sent_again)
+            self.instance.send_msg.assert_awaited_once()
+
+    async def test_falls_back_to_default_reply(self):
+        self.instance.get_default_reply = AsyncMock(
+            return_value={"text": "默认首句", "image_url": None}
+        )
+        import XianyuAutoAsync as xa
+        with patch.object(xa, "db_manager", self.manager), patch.object(
+            xa, "AUTO_REPLY", {"enabled": True}
+        ):
+            sent = await self.instance._send_purchase_first_message(
+                object(), {}, "买家", "buyer-2", "item-2", "chat-2", "now"
+            )
+            self.assertTrue(sent)
+            self.instance.send_msg.assert_awaited_once()
+            self.assertEqual(
+                self.instance.send_msg.await_args.args[3], "默认首句"
+            )
 
 
 if __name__ == "__main__":

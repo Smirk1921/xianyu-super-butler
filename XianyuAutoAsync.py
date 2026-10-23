@@ -2605,6 +2605,7 @@ class XianyuLive:
                 chat_id,
                 msg_time,
                 order_id=order_id,
+                send_first_message=False,
             )
 
             order = db_manager.get_order_by_id(order_id) or {}
@@ -2630,8 +2631,144 @@ class XianyuLive:
 
         return False
 
+    async def _send_purchase_first_message(
+        self,
+        websocket,
+        message: dict,
+        send_user_name: str,
+        send_user_id: str,
+        item_id: str,
+        chat_id: str,
+        msg_time: str,
+    ) -> bool:
+        """买家未发消息直接付款时，补发商品首句/账号默认回复。
+
+        正常聊天入口在 ``_process_chat_message_reply`` 里处理首句；但付款
+        触发消息会提前 return 到自动发货，绕过了那条链路。这里按同样的
+        优先级补一次：商品 priority=1 专属回复 -> 商品兜底/账号默认回复。
+        ``reply_once`` 已记录时跳过，避免重复问候。
+        """
+        if not chat_id or not send_user_id:
+            return False
+        if not AUTO_REPLY.get('enabled', True):
+            logger.info(f"【{self.cookie_id}】自动回复全局关闭，跳过付款首句补发")
+            return False
+
+        try:
+            payment_text = "我已付款，等待你发货"
+            if isinstance(message, dict):
+                message_1 = message.get("1", {})
+                message_10 = message_1.get("10", {}) if isinstance(message_1, dict) else {}
+                if isinstance(message_10, dict):
+                    payment_text = (
+                        message_10.get("reminderContent")
+                        or message_10.get("detailNotice")
+                        or payment_text
+                    )
+
+            item_reply = (
+                db_manager.get_item_reply(self.cookie_id, item_id)
+                if item_id else None
+            )
+            raw_item_reply = (item_reply or {}).get("reply_content") or ""
+            if (
+                item_reply
+                and raw_item_reply.strip()
+                and int(item_reply.get("priority") or 1) == 1
+            ):
+                reply_once = (
+                    1 if item_reply.get("reply_once") is None
+                    else int(item_reply.get("reply_once") or 0)
+                )
+                already_replied = bool(
+                    reply_once
+                    and db_manager.has_item_reply_record(
+                        self.cookie_id, chat_id, item_id
+                    )
+                )
+                if already_replied:
+                    logger.info(
+                        f"[{msg_time}] 【{self.cookie_id}】商品 {item_id} 的首句回复"
+                        f"本会话已发过，跳过付款补发"
+                    )
+                    return False
+
+                try:
+                    reply_text = raw_item_reply.format(
+                        send_user_name=send_user_name,
+                        send_user_id=send_user_id,
+                        send_message=payment_text,
+                        item_id=item_id,
+                    )
+                except Exception as format_error:
+                    logger.warning(
+                        f"【{self.cookie_id}】付款首句变量替换失败，使用原文: "
+                        f"{self._safe_str(format_error)}"
+                    )
+                    reply_text = raw_item_reply
+
+                await self._send_purchase_text(
+                    chat_id, send_user_id, reply_text, websocket
+                )
+                if reply_once:
+                    db_manager.add_item_reply_record(
+                        self.cookie_id, chat_id, item_id
+                    )
+                logger.info(
+                    f"[{msg_time}] 【{self.cookie_id}】订单付款前补发商品首句回复: "
+                    f"商品 {item_id}"
+                )
+                return True
+
+            # 没有 priority=1 的专属回复时，走商品兜底/账号默认回复
+            default_result = await self.get_default_reply(
+                send_user_name, send_user_id, payment_text, chat_id, item_id
+            )
+            if default_result and isinstance(default_result, dict):
+                image_url = default_result.get("image_url")
+                reply_text = default_result.get("text")
+                sent = False
+                if image_url:
+                    await self.send_image_msg(
+                        websocket or self.ws,
+                        chat_id,
+                        send_user_id,
+                        image_url,
+                    )
+                    sent = True
+                if reply_text and str(reply_text).strip():
+                    await self._send_purchase_text(
+                        chat_id, send_user_id, str(reply_text), websocket
+                    )
+                    sent = True
+                if sent:
+                    logger.info(
+                        f"[{msg_time}] 【{self.cookie_id}】订单付款前补发账号默认回复"
+                    )
+                return sent
+        except Exception as error:
+            logger.error(
+                f"【{self.cookie_id}】付款首句补发失败: {self._safe_str(error)}"
+            )
+        return False
+
+    async def _send_purchase_text(
+        self, chat_id: str, buyer_id: str, text: str, websocket
+    ) -> None:
+        """发送付款首句文本，优先使用带平台回执的发送方式。"""
+        if not str(text or "").strip():
+            return
+        self._remember_bot_reply(chat_id, text)
+        if getattr(self, "ws", None) is not None and not getattr(self.ws, "closed", False):
+            await self.send_im_text(chat_id, buyer_id, text)
+            return
+        if websocket is None:
+            raise RuntimeError("WebSocket 未连接，无法发送付款首句")
+        await self.send_msg(websocket, chat_id, buyer_id, text)
+
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
-                                   item_id: str, chat_id: str, msg_time: str, order_id: str = None):
+                                   item_id: str, chat_id: str, msg_time: str, order_id: str = None,
+                                   send_first_message: bool = True):
         """统一处理自动发货逻辑"""
         try:
             # 检查商品是否属于当前cookies
@@ -2745,6 +2882,19 @@ class XianyuLive:
                 if not self.can_auto_delivery(order_id):
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 在获取锁后检查发现仍在冷却期，跳过发货')
                     return
+
+                # 买家未发消息直接付款时，聊天入口不会经过普通回复流程。
+                # 在发确认文案/发卡之前补发一次首句，保证买家一定看到商品问候。
+                if send_first_message:
+                    await self._send_purchase_first_message(
+                        websocket,
+                        message,
+                        send_user_name,
+                        send_user_id,
+                        item_id,
+                        chat_id,
+                        msg_time,
+                    )
 
                 protection_result = await self.apply_delivery_block_rules(
                     order_id=order_id,
