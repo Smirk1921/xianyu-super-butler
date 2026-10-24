@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import {AccountDetail, ShippingRule, DefaultReply} from '../types';
-import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords, getSelfKeywordTrigger, updateSelfKeywordTrigger } from '../services/api';
+import {AccountDetail, ShippingRule, DefaultReply, Item} from '../types';
+import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords, getSelfKeywordTrigger, updateSelfKeywordTrigger, getItems } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
 import { confirmAction, notify } from '../services/feedback';
 import { EmptyState, PageHeader, PageLoading, PageTabs, SectionHeader } from './ui';
@@ -19,6 +19,10 @@ interface Keyword {
   reply_content: string;
   match_type: 'exact' | 'fuzzy';
   enabled: boolean;
+  /** 为空表示全局关键词；非空表示只对指定商品生效 */
+  item_id?: string;
+  type?: string;
+  image_url?: string;
 }
 
 interface DeliveryRuleForm {
@@ -44,11 +48,15 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
 
   // 关键词回复相关状态
   const [keywords, setKeywords] = useState<Keyword[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
+  const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'item'>('all');
+  const [productFilter, setProductFilter] = useState('');
   const [showReplyModal, setShowReplyModal] = useState(false);
   const [editingKeyword, setEditingKeyword] = useState<Keyword | null>(null);
   const [replyForm, setReplyForm] = useState({
     keyword: '',
-    reply_content: ''
+    reply_content: '',
+    item_id: ''
   });
 
   // 关键词发货相关状态
@@ -112,6 +120,39 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
       .catch(() => setSelfTrigger(false));
   }, [mode, selectedAccount]);
 
+  useEffect(() => {
+    if (mode !== 'reply') return;
+    getItems()
+      .then(setItems)
+      .catch((error) => console.error('加载商品列表失败', error));
+  }, [mode]);
+
+  const accountItems = useMemo(
+    () => items.filter((item) => item.cookie_id === selectedAccount),
+    [items, selectedAccount],
+  );
+
+  const itemTitleById = useMemo(
+    () => new Map(accountItems.map((item) => [
+      item.item_id,
+      item.item_title || item.item_id,
+    ])),
+    [accountItems],
+  );
+
+  const visibleKeywords = useMemo(() => {
+    let filtered = keywords;
+    if (scopeFilter === 'global') {
+      filtered = filtered.filter((keyword) => !keyword.item_id);
+    } else if (scopeFilter === 'item') {
+      filtered = filtered.filter((keyword) => Boolean(keyword.item_id));
+    }
+    if (productFilter) {
+      filtered = filtered.filter((keyword) => keyword.item_id === productFilter);
+    }
+    return filtered;
+  }, [keywords, scopeFilter, productFilter]);
+
   const loadDefaultReplies = async () => {
     try {
       const data = await getDefaultReplies();
@@ -159,7 +200,7 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
       setShowDeliveryModal(true);
     } else if (activeTab === 'reply') {
       setEditingKeyword(null);
-      setReplyForm({ keyword: '', reply_content: '' });
+      setReplyForm({ keyword: '', reply_content: '', item_id: '' });
       setShowReplyModal(true);
     } else {
       // default tab - 编辑选中账号的默认回复
@@ -200,7 +241,8 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
       setEditingKeyword(keyword);
       setReplyForm({
         keyword: keyword.keyword,
-        reply_content: keyword.reply_content
+        reply_content: keyword.reply_content,
+        item_id: keyword.item_id || ''
       });
       setShowReplyModal(true);
     }
@@ -235,7 +277,8 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
           keyword: replyForm.keyword,
           reply_content: replyForm.reply_content,
           match_type: 'exact',
-          enabled: true
+          enabled: true,
+          item_id: replyForm.item_id || undefined,
         },
         selectedAccount
       );
@@ -445,6 +488,39 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                 ))}
               </select>
               {activeTab === 'reply' && selectedAccount && (
+                <>
+                  <select
+                    className="ios-input rounded-md px-3 py-2.5 text-sm"
+                    value={scopeFilter}
+                    onChange={(event) => {
+                      setScopeFilter(event.target.value as 'all' | 'global' | 'item');
+                      if (event.target.value === 'global') setProductFilter('');
+                    }}
+                    aria-label="关键词适用范围"
+                  >
+                    <option value="all">全部范围</option>
+                    <option value="global">全局（所有商品）</option>
+                    <option value="item">指定商品</option>
+                  </select>
+                  <select
+                    className="ios-input max-w-56 rounded-md px-3 py-2.5 text-sm"
+                    value={productFilter}
+                    onChange={(event) => {
+                      setProductFilter(event.target.value);
+                      if (event.target.value) setScopeFilter('item');
+                    }}
+                    aria-label="按商品筛选关键词"
+                  >
+                    <option value="">全部商品</option>
+                    {accountItems.map((item) => (
+                      <option key={item.item_id} value={item.item_id}>
+                        {(item.item_title || item.item_id).slice(0, 28)}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
+              {activeTab === 'reply' && selectedAccount && (
                 <div className="flex items-center gap-2 pl-1">
                   {renderStatusSwitch(
                     selfTrigger,
@@ -495,16 +571,28 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
           <section className="section-panel">
             <SectionHeader
               title="关键词回复规则"
-              description={`当前账号共 ${keywords.length} 条规则`}
+              description={`当前账号共 ${keywords.length} 条规则，当前显示 ${visibleKeywords.length} 条`}
               icon={Key}
             />
             <div className="divide-y divide-gray-100">
-              {keywords.map((keyword) => (
+              {visibleKeywords.map((keyword) => (
                 <article key={keyword.id} className="grid gap-3 px-4 py-4 sm:grid-cols-[minmax(160px,0.7fr)_minmax(0,1.5fr)_auto] sm:items-center">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <h3 className="break-words text-sm font-bold text-gray-900">{keyword.keyword}</h3>
                       <span className="status-badge status-badge-success">精确匹配</span>
+                      {keyword.item_id ? (
+                        <span
+                          className="status-badge max-w-44 truncate bg-blue-50 text-blue-700"
+                          title={`仅对商品 ${keyword.item_id} 生效`}
+                        >
+                          商品：{itemTitleById.get(keyword.item_id) || keyword.item_id}
+                        </span>
+                      ) : (
+                        <span className="status-badge bg-gray-100 text-gray-600" title="对所有商品生效">
+                          全局
+                        </span>
+                      )}
                     </div>
                   </div>
                   <p className="min-w-0 whitespace-pre-wrap break-words text-sm leading-6 text-gray-600">
@@ -530,8 +618,17 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                   </div>
                 </article>
               ))}
-              {keywords.length === 0 && (
-                <EmptyState compact title="暂无关键词回复" description="添加规则后，命中关键词的买家消息将使用指定内容回复。" icon={MessageSquare} />
+              {visibleKeywords.length === 0 && (
+                <EmptyState
+                  compact
+                  title={keywords.length === 0 ? '暂无关键词回复' : '当前筛选下没有关键词'}
+                  description={
+                    keywords.length === 0
+                      ? '添加规则后，命中关键词的买家消息将使用指定内容回复。'
+                      : '切换范围或商品筛选查看其他规则。'
+                  }
+                  icon={MessageSquare}
+                />
               )}
             </div>
           </section>
@@ -686,6 +783,31 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                   placeholder="例如：价格、包邮"
                   className="ios-input w-full rounded-md px-3 py-2.5"
                 />
+              </label>
+              <label className="block">
+                <span className="field-label">适用范围</span>
+                <select
+                  value={replyForm.item_id}
+                  onChange={(event) => setReplyForm({ ...replyForm, item_id: event.target.value })}
+                  className="ios-input w-full rounded-md px-3 py-2.5"
+                >
+                  <option value="">全局（所有商品）</option>
+                  {accountItems.map((item) => (
+                    <option key={item.item_id} value={item.item_id}>
+                      {item.item_title || item.item_id}
+                    </option>
+                  ))}
+                  {replyForm.item_id && !accountItems.some(
+                    (item) => item.item_id === replyForm.item_id
+                  ) && (
+                    <option value={replyForm.item_id}>
+                      {replyForm.item_id}（商品未同步）
+                    </option>
+                  )}
+                </select>
+                <p className="mt-1 text-xs text-gray-500">
+                  全局关键词会在该账号所有商品会话中触发；指定商品只在该商品会话触发。
+                </p>
               </label>
               <label className="block">
                 <span className="field-label">回复内容</span>

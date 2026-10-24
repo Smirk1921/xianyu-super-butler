@@ -116,9 +116,19 @@ class ItemFeatureTests(unittest.TestCase):
             "VALUES ('acc', 'item-2', '新商品', '新商品详情')"
         )
         self.manager.conn.commit()
+        self.manager.save_text_keywords_only(
+            "acc",
+            [
+                ("全局词", "全局回复", None),
+                ("旧商品词", "旧回复", "item-1"),
+            ],
+        )
 
         payload = {
             "version": 1,
+            "keywords": [
+                {"keyword": "模板关键词", "reply": "模板关键词回复", "type": "text", "image_url": ""},
+            ],
             "delivery_config": {
                 "enabled": True,
                 "is_multi_spec": False,
@@ -163,6 +173,15 @@ class ItemFeatureTests(unittest.TestCase):
         self.assertEqual(delivery["variants"][0]["delivery_count"], 2)
         self.assertEqual(
             self.manager.get_item_reply("acc", "item-2")["reply_content"], "模板回复"
+        )
+        item2_keywords = self.manager.get_keywords_for_item("acc", "item-2")
+        self.assertEqual([row["keyword"] for row in item2_keywords], ["模板关键词"])
+        item1_keywords = self.manager.get_keywords_for_item("acc", "item-1")
+        self.assertEqual([row["keyword"] for row in item1_keywords], ["旧商品词"])
+        all_keywords = self.manager.get_keywords_with_type("acc")
+        self.assertIn(
+            ("全局词", None),
+            [(row["keyword"], row["item_id"]) for row in all_keywords],
         )
         relist = self.manager.get_item_relist_setting(self.user_id, "acc", "item-2")
         self.assertEqual(relist["enabled"], 1)

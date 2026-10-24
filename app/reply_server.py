@@ -4982,6 +4982,11 @@ def update_keywords_with_item_id(cid: str, body: KeywordWithItemIdIn, current_us
 
         if not keyword:
             raise HTTPException(status_code=400, detail="关键词不能为空")
+        if item_id and not db_manager.get_item_info(cid, item_id):
+            raise HTTPException(
+                status_code=400,
+                detail=f"商品 {item_id} 不在当前账号的商品库中，无法绑定关键词",
+            )
 
         # 检查当前提交的关键词中是否有重复
         keyword_key = f"{keyword}|{item_id or ''}"
@@ -8730,6 +8735,19 @@ def _build_item_setting_template_payload(
             "reply_once": int(item_reply.get("reply_once", 1)),
         }
 
+    item_keywords = db_manager.get_keywords_for_item(cookie_id, item_id)
+    if item_keywords:
+        payload["keywords"] = [
+            {
+                "keyword": row.get("keyword") or "",
+                "reply": row.get("reply") or "",
+                "type": row.get("type") or "text",
+                "image_url": row.get("image_url") or "",
+            }
+            for row in item_keywords
+            if str(row.get("keyword") or "").strip()
+        ]
+
     relist = db_manager.get_item_relist_setting(user_id, cookie_id, item_id)
     if relist:
         payload["relist"] = {
@@ -8824,6 +8842,11 @@ def _apply_item_setting_template(
         )
         applied.append("商品专属回复")
 
+    keywords = payload.get("keywords") or []
+    if keywords:
+        db_manager.replace_keywords_for_item(cookie_id, item_id, keywords)
+        applied.append("商品关键词")
+
     relist = payload.get("relist") or {}
     if relist:
         db_manager.upsert_item_relist_setting(
@@ -8886,6 +8909,8 @@ def list_item_setting_templates(
                 "has_delivery": bool(delivery.get("variants")),
                 "delivery_variants": len(delivery.get("variants") or []),
                 "has_reply": bool((payload.get("item_reply") or {}).get("reply_content")),
+                "has_keywords": bool(payload.get("keywords")),
+                "keyword_count": len(payload.get("keywords") or []),
                 "has_relist": bool(payload.get("relist")),
                 "has_confirmation": bool(payload.get("confirmation")),
             }
@@ -8917,7 +8942,10 @@ def create_item_setting_template_from_item(
         )
         meaningful = any(
             template_payload.get(key)
-            for key in ("delivery_config", "item_reply", "relist", "confirmation")
+            for key in (
+                "delivery_config", "item_reply", "keywords",
+                "relist", "confirmation",
+            )
         )
         if not meaningful and not (template_payload.get("item") or {}).get(
             "multi_quantity_delivery"
@@ -8984,6 +9012,8 @@ def apply_item_setting_template(
         }
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

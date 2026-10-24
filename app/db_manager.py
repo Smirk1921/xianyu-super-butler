@@ -2835,6 +2835,66 @@ class DBManager:
                 self.conn.rollback()
                 return False
     
+    def get_keywords_for_item(self, cookie_id: str, item_id: str) -> List[Dict[str, Any]]:
+        """读取某个商品专属的关键词规则（模板保存用）。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT keyword, reply, item_id, type, image_url
+                    FROM keywords
+                    WHERE cookie_id = ? AND item_id = ?
+                    ORDER BY rowid ASC
+                ''', (cookie_id, item_id))
+                columns = [description[0] for description in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"读取商品关键词失败: {e}")
+            return []
+
+    def replace_keywords_for_item(
+        self, cookie_id: str, item_id: str, keywords: List[Dict[str, Any]]
+    ) -> bool:
+        """用模板关键词替换目标商品的关键词，不影响全局和其他商品。"""
+        target_item = str(item_id or "").strip()
+        if not target_item:
+            return False
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "DELETE FROM keywords WHERE cookie_id = ? AND item_id = ?",
+                    (cookie_id, target_item),
+                )
+                for row in keywords or []:
+                    keyword = str(row.get("keyword") or "").strip()
+                    if not keyword:
+                        continue
+                    keyword_type = str(row.get("type") or "text").strip().lower()
+                    if keyword_type not in ("text", "image"):
+                        keyword_type = "text"
+                    reply = str(row.get("reply") or "")
+                    image_url = str(row.get("image_url") or "")
+                    if keyword_type == "image" and not image_url:
+                        raise ValueError(f"图片关键词「{keyword}」缺少图片地址")
+                    cursor.execute('''
+                        INSERT INTO keywords
+                            (cookie_id, keyword, reply, item_id, type, image_url)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (
+                        cookie_id, keyword, reply, target_item,
+                        keyword_type, image_url or None,
+                    ))
+                self.conn.commit()
+                return True
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"替换商品关键词失败: {e}")
+            raise
+
     def get_keywords(self, cookie_id: str) -> List[Tuple[str, str]]:
         """获取指定Cookie的关键字列表（向后兼容方法）"""
         with self.lock:

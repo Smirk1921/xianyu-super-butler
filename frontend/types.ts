@@ -222,6 +222,8 @@ export interface ItemSettingTemplate {
     has_delivery: boolean;
     delivery_variants: number;
     has_reply: boolean;
+    has_keywords: boolean;
+    keyword_count: number;
     has_relist: boolean;
     has_confirmation: boolean;
   };
@@ -575,6 +577,8 @@ export interface ReplyRule {
   enabled: boolean;
   /** 为空表示通用关键词；非空表示只对该商品生效 */
   item_id?: string;
+  type?: string;
+  image_url?: string;
 }
 
 /** 单个商品的专属自动回复 */

@@ -1074,7 +1074,9 @@ export const getReplyRules = async (cookieId?: string): Promise<ReplyRule[]> => 
         reply_content: item.reply || '',
         item_id: item.item_id || '',
         match_type: 'exact' as const,
-        enabled: true
+        enabled: true,
+        type: item.type || 'text',
+        image_url: item.image_url || '',
     }));
 }
 
@@ -1092,6 +1094,9 @@ export const updateReplyRule = async (rule: Partial<ReplyRule>, cookieId: string
                 ...keywords[index],
                 keyword: rule.keyword,
                 reply: rule.reply_content,
+                ...(rule.item_id !== undefined
+                  ? { item_id: rule.item_id || '' }
+                  : {}),
             };
         }
     } else {

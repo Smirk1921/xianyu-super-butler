@@ -1238,8 +1238,8 @@ const ItemList: React.FC = () => {
               {/* 各列用固定宽度而非 minmax 压缩：列宽足够时内容不再挤在一起，
                   窗口放不下就由外层容器左右滚动。表头与行共用同一套列宽定义。 */}
               <div className="overflow-x-auto">
-                <div className="min-w-full xl:min-w-[1200px]">
-                  <div className="hidden grid-cols-[340px_140px_260px_210px_110px] border-b-2 border-gray-300 bg-gray-100 text-xs font-bold text-gray-600 xl:grid [&>span]:border-r [&>span]:border-gray-300 [&>span]:px-4 [&>span]:py-3 [&>span:nth-child(2)]:px-2 [&>span:last-child]:border-r-0">
+                <div className="min-w-full xl:min-w-[1320px]">
+                  <div className="hidden grid-cols-[320px_120px_250px_210px_220px] border-b-2 border-gray-300 bg-gray-100 text-xs font-bold text-gray-600 xl:grid [&>span]:border-r [&>span]:border-gray-300 [&>span]:px-4 [&>span]:py-3 [&>span:nth-child(2)]:px-2 [&>span:last-child]:border-r-0">
                     <span>商品信息</span>
                     <span>所属账号</span>
                     <span>专属自动发货</span>
@@ -1281,7 +1281,7 @@ const ItemList: React.FC = () => {
                   return (
                     <article
                       key={key}
-                      className="grid gap-4 px-4 py-4 transition-colors hover:bg-[#fffdf0] xl:grid-cols-[340px_140px_260px_210px_110px] xl:items-stretch xl:gap-0 xl:px-0 xl:[&>*]:flex xl:[&>*]:min-w-0 xl:[&>*]:flex-col xl:[&>*]:justify-center xl:[&>*]:border-r xl:[&>*]:border-gray-200 xl:[&>*]:px-4 xl:[&>*:first-child]:!flex-row xl:[&>*:first-child]:items-center xl:[&>*:last-child]:border-r-0"
+                      className="grid gap-4 px-4 py-4 transition-colors hover:bg-[#fffdf0] xl:grid-cols-[320px_120px_250px_210px_220px] xl:items-stretch xl:gap-0 xl:px-0 xl:[&>*]:flex xl:[&>*]:min-w-0 xl:[&>*]:flex-col xl:[&>*]:justify-center xl:[&>*]:border-r xl:[&>*]:border-gray-200 xl:[&>*]:px-4 xl:[&>*:first-child]:!flex-row xl:[&>*:first-child]:items-center xl:[&>*:last-child]:border-r-0"
                     >
                       <div className="flex min-w-0 gap-3">
                         <div className="h-20 w-20 flex-none overflow-hidden rounded-md border border-gray-200 bg-gray-100">
@@ -1443,7 +1443,7 @@ const ItemList: React.FC = () => {
                       </div>
 
                       <div className="flex items-center justify-end gap-1 border-t border-gray-100 pt-3 xl:!flex-row xl:items-center xl:justify-end xl:border-0 xl:pt-0">
-                        <div className="flex items-center gap-1">
+                        <div className="flex flex-wrap items-center justify-end gap-1">
                           <button
                             type="button"
                             onClick={() => void openTemplateModal(item)}
@@ -1676,6 +1676,11 @@ const ItemList: React.FC = () => {
                         {selectedTemplate.summary.has_reply && (
                           <span className="rounded bg-white px-2 py-1 font-semibold text-blue-700">
                             专属回复
+                          </span>
+                        )}
+                        {selectedTemplate.summary.has_keywords && (
+                          <span className="rounded bg-white px-2 py-1 font-semibold text-violet-700">
+                            关键词 {selectedTemplate.summary.keyword_count} 条
                           </span>
                         )}
                         {selectedTemplate.summary.has_relist && (
