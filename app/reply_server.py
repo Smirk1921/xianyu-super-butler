@@ -8003,6 +8003,9 @@ def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(g
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
 
+ITEM_REPLY_CONTENT_MAX_LENGTH = 2000
+
+
 class ItemReplyIn(BaseModel):
     reply_content: str
     # 1=命中该商品时优先回复；0=仅作为关键词/AI 未命中后的兜底
@@ -8033,6 +8036,11 @@ def update_item_reply(
         reply_content = (data.reply_content or "").strip()
         if not reply_content:
             raise HTTPException(status_code=400, detail="回复内容不能为空")
+        if len(reply_content) > ITEM_REPLY_CONTENT_MAX_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"回复内容不能超过 {ITEM_REPLY_CONTENT_MAX_LENGTH} 个字符",
+            )
 
         # 防止给不存在的商品写孤儿配置
         if not db_manager.get_item_info(cookie_id, item_id):

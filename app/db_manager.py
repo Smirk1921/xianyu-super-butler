@@ -1278,14 +1278,18 @@ class DBManager:
             if 'reply_once' not in item_replay_columns:
                 logger.info("添加item_replay表的reply_once列...")
                 cursor.execute("ALTER TABLE item_replay ADD COLUMN reply_once INTEGER DEFAULT 1")
+            # 保留 id 最大的一行（最近写入），避免旧内容覆盖新配置。
             cursor.execute('''
                 DELETE FROM item_replay
                 WHERE id NOT IN (
-                    SELECT MIN(id) FROM item_replay GROUP BY cookie_id, item_id
+                    SELECT MAX(id) FROM item_replay GROUP BY cookie_id, item_id
                 )
             ''')
+            # 旧版本建过 idx_item_replay_cookie_item，统一迁移到新索引名，
+            # 避免同一个唯一键上叠两个功能相同的索引。
+            cursor.execute("DROP INDEX IF EXISTS idx_item_replay_cookie_item")
             cursor.execute('''
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_item_replay_cookie_item
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_item_replay_unique
                 ON item_replay(cookie_id, item_id)
             ''')
 
