@@ -278,7 +278,7 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
           reply_content: replyForm.reply_content,
           match_type: 'exact',
           enabled: true,
-          item_id: replyForm.item_id || undefined,
+          item_id: replyForm.item_id,
         },
         selectedAccount
       );
