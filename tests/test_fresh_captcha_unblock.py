@@ -58,13 +58,13 @@ class FreshCaptchaUnblockTests(unittest.TestCase):
         registry.get.assert_called_once_with('cid-1')
         guard.reset.assert_called_once()
 
-    def test_already_recovered_skips_reset(self):
-        """令牌接口直接给了 accessToken 说明风控已解除，不需要再动熔断。"""
+    def test_already_recovered_clears_risk_block(self):
+        """令牌接口给了 accessToken 说明风控已解除，本地冷却也要清掉。"""
         result, registry, guard = self._run({
             'data': {'accessToken': 'tok-ok'},
         })
         self.assertFalse(result['need_verify'], result)
-        guard.reset.assert_not_called()
+        guard.reset.assert_called_once()
 
 
 if __name__ == '__main__':

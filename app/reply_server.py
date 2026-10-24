@@ -10620,7 +10620,9 @@ async def get_fresh_captcha_url(
             from utils.item_relist import merge_cookie_strings, parse_cookie_string
             from utils.xianyu_seller_api import XianyuSellerAPI
 
-            async with XianyuSellerAPI(cookie_id, cookies_str) as seller_api:
+            async with XianyuSellerAPI(
+                cookie_id, cookies_str, ignore_risk_control=True
+            ) as seller_api:
                 try:
                     await seller_api.get_sold_orders(
                         page_number=1, rows_per_page=1, query_code='ALL'
@@ -10707,6 +10709,10 @@ async def get_fresh_captcha_url(
     data = data if isinstance(data, dict) else {}
 
     if data.get('accessToken'):
+        # 已经能拿到 Token 说明风控解除，本地熔断也要一起清掉，
+        # 否则心跳仍会被冷却期挡住，账号看起来一直没恢复。
+        from utils import risk_control
+        risk_control.registry.get(cookie_id).reset()
         log_with_user('info', f'账号 {cookie_id} 风控已解除，无需验证', current_user)
         return {
             'success': True,

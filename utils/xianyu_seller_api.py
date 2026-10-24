@@ -66,11 +66,16 @@ class XianyuSellerAPI:
         "NOT_SHIP_EXPIRED",
     )
 
-    def __init__(self, cookie_id: str, cookies_str: str, session: Optional[aiohttp.ClientSession] = None):
+    def __init__(self, cookie_id: str, cookies_str: str,
+                 session: Optional[aiohttp.ClientSession] = None,
+                 ignore_risk_control: bool = False):
         self.cookie_id = cookie_id
         self.cookies_str = cookies_str or ""
         self._session = session
         self._owns_session = session is None
+        # 仅用于“用户主动打开验证页”时补 _m_h5_tk：本地冷却不能把
+        # 验证入口一起锁死，否则永远拿不到验证链接。
+        self.ignore_risk_control = bool(ignore_risk_control)
 
     async def __aenter__(self) -> "XianyuSellerAPI":
         await self._ensure_session()
@@ -138,7 +143,7 @@ class XianyuSellerAPI:
         last_ret: List[str] = []
         # 熔断：账号处于风控冷却期时直接放弃，继续请求只会延长风控
         guard = risk_control.registry.get(self.cookie_id)
-        if guard.is_blocked:
+        if guard.is_blocked and not self.ignore_risk_control:
             raise risk_control.RiskControlBlocked(
                 self.cookie_id, guard.remaining_seconds, guard.last_hit_reason
             )
@@ -166,8 +171,10 @@ class XianyuSellerAPI:
 
             session = await self._ensure_session()
             url = self.BASE_URL.format(api=api, version=version)
-            # 限流：控制每账号的请求速率，多账号并发时也不会突发
-            await guard.acquire()
+            # 限流：控制每账号的请求速率，多账号并发时也不会突发。
+            # 补验证链接这一次允许穿透冷却，但仍只发一个请求。
+            if not self.ignore_risk_control:
+                await guard.acquire()
             async with session.post(
                 url,
                 params=params,
@@ -181,14 +188,17 @@ class XianyuSellerAPI:
 
             ret_list = [str(value) for value in (result.get("ret", []) if isinstance(result, dict) else [])]
             if any("SUCCESS" in value for value in ret_list):
-                guard.reset()
+                if not self.ignore_risk_control:
+                    guard.reset()
                 return result
 
             last_ret = ret_list
 
-            # 平台风控：立刻熔断，不重试
+            # 平台风控：立刻熔断，不重试。补验证链接的请求本身
+            # 就是来解风控的，不能再叠加一次熔断。
             if risk_control.is_risk_control_error("; ".join(ret_list)):
-                guard.trip("; ".join(ret_list))
+                if not self.ignore_risk_control:
+                    guard.trip("; ".join(ret_list))
                 raise SellerApiError(api, ret_list)
 
             # 服务端对令牌过期有两种拼写，且历史版本存在拼写错误（EXOIRED）
