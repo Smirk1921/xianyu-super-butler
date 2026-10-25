@@ -158,7 +158,12 @@ async def open_manual_session(
         ``{"success": bool, "cookies_str": str, "message": str, "session_id": str}``。
         成功时 ``cookies_str`` 是完成验证后的新 Cookie，调用方应保存。
     """
-    from playwright.async_api import async_playwright
+    # Patchright 是 Playwright 的反检测分支，同一套 async API 但能隐藏
+    # navigator.webdriver。人工验证必须优先用它；容器里已安装 patchright。
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError:
+        from playwright.async_api import async_playwright
 
     from utils.captcha_remote_control import captcha_controller
 
