@@ -75,6 +75,9 @@ const AccountList: React.FC = () => {
   // 账号恢复时立刻反映到界面，而不是等默认 30s 轮询
   const captchaWatchRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const captchaImgRef = useRef<HTMLImageElement>(null);
+  // 远端浏览器每个 mousemove 都转发会让 2 核服务器截图排队，拖动变卡；
+  // 40ms 一帧（约25Hz）足够视觉跟手，松手事件不受节流影响。
+  const captchaLastMoveRef = useRef(0);
   const [failedAvatars, setFailedAvatars] = useState<Set<string>>(new Set());
 
   // 编辑表单状态
@@ -193,9 +196,9 @@ const AccountList: React.FC = () => {
       }
       if (result.verification_url) {
         window.open(result.verification_url, '_blank', 'noopener,noreferrer');
-        notify('已打开验证页；滑块通过后页面可能跳转到淘宝，属正常现象，直接关闭即可', 'info');
-        // 后端取链接时已解除熔断，心跳正在恢复令牌。这里临时加密轮询（10s × 3 分钟），
-        // 验证生效后账号状态立刻刷新 —— 用户不用猜「验证到底成没成」
+        notify('已打开验证页。此方式不会把 x5sec 写回服务器；如需立即恢复，请改用「人工验证」', 'info');
+        // 后端拿到 punish URL 不再解除熔断。保留 10s 轮询只是展示冷却到期后的
+        // 探测结果，避免用户以为本机浏览器验证会即时生效。
         if (captchaWatchRef.current) clearInterval(captchaWatchRef.current);
         let ticks = 18;
         captchaWatchRef.current = setInterval(async () => {
@@ -351,6 +354,11 @@ const AccountList: React.FC = () => {
     const ws = captchaWsRef.current;
     const img = captchaImgRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN || !img || !img.naturalWidth) return;
+
+    const now = performance.now();
+    if (eventType === 'move' && now - captchaLastMoveRef.current < 40) return;
+    if (eventType === 'move') captchaLastMoveRef.current = now;
+    if (eventType === 'down') captchaLastMoveRef.current = 0;
 
     const rect = img.getBoundingClientRect();
     // 截图在页面上被等比缩放显示，坐标要按缩放比还原回原始分辨率
@@ -755,15 +763,15 @@ const AccountList: React.FC = () => {
                     用同一个闲鱼账号重新扫码，即可覆盖并恢复该账号。
                   </p>
                 )}
-                {/* 闲鱼要求人机验证时给出「自己浏览器打开」的入口。
-                    服务器端用 CDP 拖滑块通过率很低（风控查的是合并前子事件密度，
-                    自动化派发每帧只有一个），用真实鼠标过一次要可靠得多。 */}
+                {/* 闲鱼要求人机验证时的辅助入口。服务器端人工镜像会把 x5sec
+                    合并回数据库，是首选；本机浏览器链路的 x5sec 留在本机环境，
+                    且出口 IP 不同，只能作为辅助，不能承诺立即恢复。 */}
                 {blockedState?.verification_url && (
                   <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
                     <p className="font-bold">闲鱼要求完成人机验证，账号暂时拿不到令牌</p>
                     <p className="mt-1">
-                      推荐用你自己的浏览器打开验证页、用真实鼠标拖动滑块，通过率远高于服务器自动拖动。
-                      验证通过后本页会自动恢复，无需重新扫码。
+                      优先点右侧「人工验证」在服务器正式 Chrome 里拖动，成功后凭证会写回本系统。
+                      「在我的浏览器打开验证页」只作辅助：验证结果留在本机浏览器/IP，服务端仍需等冷却结束并探测成功。
                     </p>
                     <button
                       type="button"

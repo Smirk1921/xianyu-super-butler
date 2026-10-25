@@ -2290,6 +2290,7 @@ class XianyuSliderStealth:
         """
         failure_records = []
         current_strategy = 'human_like'  # 拟人策略（旧的 ultra_fast 统计已作废，不再混算）
+        element_miss_count = 0
         
         for attempt in range(1, max_retries + 1):
             try:
@@ -2327,7 +2328,34 @@ class XianyuSliderStealth:
                 slider_container, slider_button, slider_track = self.find_slider_elements(fast_mode=fast_mode)
                 if not all([slider_container, slider_button, slider_track]):
                     logger.error(f"【{self.pure_user_id}】滑块元素查找失败")
+                    element_miss_count += 1
+                    if attempt < max_retries:
+                        # 惩罚页常在 HTML 到达后几百毫秒仍没挂载 nc 组件。
+                        # 此前 0.5 秒一次连续找三次，2 秒内把机会全部烧完。
+                        miss_wait = random.uniform(2.5, 4.0)
+                        logger.warning(
+                            f"【{self.pure_user_id}】滑块未渲染，等待 "
+                            f"{miss_wait:.1f} 秒后重新检测"
+                        )
+                        time.sleep(miss_wait)
+                        # 连续两次找不到组件时刷新一次惩罚页；仅“找不到元素”允许
+                        # reload，真实拖动失败仍遵守 Ydisks 的不 reload 规则。
+                        if element_miss_count >= 2 and self._current_url:
+                            try:
+                                self.page.goto(
+                                    self._current_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=20000,
+                                )
+                                self.slider_frame = None
+                                time.sleep(random.uniform(1.0, 1.8))
+                            except Exception as reload_err:
+                                logger.warning(
+                                    f"【{self.pure_user_id}】滑块未渲染时刷新验证页失败: {reload_err}"
+                                )
                     continue
+
+                element_miss_count = 0
                 
                 # 2. 计算滑动距离
                 slide_distance = self.calculate_slide_distance(slider_button, slider_track)

@@ -57,6 +57,15 @@ RUN apt-get update && \
         npm && \
     rm -rf /var/lib/apt/lists/*
 
+# 阿里 nc 滑块能识别 Playwright 自带 Chromium 的指纹；正式版 Chrome + 持久化
+# profile 是上游实测可显著提高通过率的组合。Debian bookworm 直接安装官方 deb。
+RUN curl -fsSL -o /tmp/google-chrome.deb \
+      https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends /tmp/google-chrome.deb && \
+    rm -f /tmp/google-chrome.deb && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /app /app
 
@@ -67,8 +76,10 @@ RUN playwright install-deps chromium && \
     patchright install-deps chromium && \
     playwright install chromium && \
     patchright install chromium && \
-    mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
-    chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images && \
+    mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images \
+             /app/browser_data /app/trajectory_history && \
+    chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images \
+              /app/browser_data /app/trajectory_history && \
     chmod +x /app/entrypoint.sh
 
 EXPOSE 8080

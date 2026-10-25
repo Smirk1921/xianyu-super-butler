@@ -47,6 +47,10 @@ class RiskControlDetectionTests(unittest.TestCase):
 
 
 class AccountGuardTests(unittest.TestCase):
+    def tearDown(self):
+        # AccountGuard.trip 现在会联动全局出口 IP 熔断，测试后必须清理。
+        risk_control.global_guard.reset('test')
+
     def test_cooldown_grows_with_consecutive_hits(self):
         """连续命中风控时冷却时间要递增，否则起不到退避作用。"""
         guard = AccountGuard("acc")
@@ -89,9 +93,11 @@ class GuardedCallTests(unittest.TestCase):
         # 用独立注册表，避免污染全局状态
         self._original = risk_control.registry
         risk_control.registry = RiskControlRegistry(rate_per_minute=600)
+        risk_control.global_guard.reset('test')
 
     def tearDown(self):
         risk_control.registry = self._original
+        risk_control.global_guard.reset('test')
 
     def test_risk_control_error_trips_breaker_and_blocks_next_call(self):
         async def failing():

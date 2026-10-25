@@ -4,16 +4,20 @@
 如果继续按原节奏重试，风控不会自行解除 —— 反而因为持续请求一直延长。
 一次事故里重试风暴达到每分钟 670~970 次请求，持续两小时未恢复。
 
-这里提供两层保护：
+这里提供三层保护：
 
-- **熔断**：命中风控特征后，该账号进入冷却期，期间拒绝一切主动请求，
+- **账号熔断**：命中风控特征后，该账号进入冷却期，期间拒绝一切主动请求，
   冷却时间按连续命中次数指数增长。
+- **出口 IP 全局熔断**：多个账号共享同一服务器出口 IP。任意账号命中
+  RGV587 后，其他账号继续请求/滑块只会把整个 IP 的惩罚时间拉长；全局
+  熔断会让所有账号一起停发主动请求，到期后先放行一个探测。
 - **限流**：令牌桶控制每个账号的请求速率，多账号并发时也不会突发。
 
-两者都是进程内状态，重启后重置 —— 这是可接受的，因为重启本身会间隔较久。
+三者都是进程内状态，重启后重置 —— 这是可接受的，因为重启本身会间隔较久。
 """
 
 import asyncio
+import threading
 import time
 from typing import Dict
 
@@ -35,6 +39,77 @@ RISK_CONTROL_MARKERS = (
 # 从 5 分钟~2 小时下调到 1~20 分钟：滑块失败判定此前会把平台限流文案和
 # 「容器仍存在」误判成验证失败，冷却动辄按小时计，账号被白白锁住。
 COOLDOWN_STEPS = (60, 180, 300, 600, 1200)
+
+# 全局出口 IP 熔断阶梯。单账号 60 秒冷却对“IP 已被惩罚”远远不够：
+# 其他账号仍会继续请求并触发新滑块。全局冷却从 10 分钟起，持续命中则升级。
+GLOBAL_COOLDOWN_STEPS = (600, 1200, 3600, 7200)
+
+
+class GlobalRiskGuard:
+    """同一进程内所有账号共享的出口 IP 熔断状态。"""
+
+    def __init__(self) -> None:
+        self.blocked_until = 0.0
+        self.consecutive_hits = 0
+        self.last_hit_reason = ""
+        self.last_hit_cookie_id = ""
+        self._lock = threading.Lock()
+
+    @property
+    def is_blocked(self) -> bool:
+        return time.monotonic() < self.blocked_until
+
+    @property
+    def remaining_seconds(self) -> int:
+        return max(0, int(self.blocked_until - time.monotonic()))
+
+    def trip(self, cookie_id: str, reason: str = "") -> int:
+        with self._lock:
+            step = min(self.consecutive_hits, len(GLOBAL_COOLDOWN_STEPS) - 1)
+            cooldown = GLOBAL_COOLDOWN_STEPS[step]
+            self.consecutive_hits += 1
+            self.blocked_until = time.monotonic() + cooldown
+            self.last_hit_reason = str(reason or "")[:200]
+            self.last_hit_cookie_id = cookie_id
+            logger.warning(
+                f"【{cookie_id}】触发全局出口 IP 风控熔断：所有账号暂停主动请求 "
+                f"{cooldown} 秒（全局连续第 {self.consecutive_hits} 次）: "
+                f"{self.last_hit_reason[:80]}"
+            )
+            return cooldown
+
+    def reset(self, cookie_id: str = "") -> None:
+        with self._lock:
+            if self.consecutive_hits or self.blocked_until:
+                logger.info(
+                    f"【{cookie_id or 'global'}】全局出口 IP 风控状态已解除"
+                )
+            self.consecutive_hits = 0
+            self.blocked_until = 0.0
+            self.last_hit_reason = ""
+            self.last_hit_cookie_id = ""
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            return {
+                "blocked": self.is_blocked,
+                "remaining_seconds": self.remaining_seconds,
+                "consecutive_hits": self.consecutive_hits,
+                "reason": self.last_hit_reason,
+                "cookie_id": self.last_hit_cookie_id,
+            }
+
+
+# 进程级全局出口 IP 熔断。必须在 AccountGuard 之前实例化，账号 trip 时联动。
+global_guard = GlobalRiskGuard()
+
+
+def is_globally_blocked() -> bool:
+    return global_guard.is_blocked
+
+
+def global_remaining_seconds() -> int:
+    return global_guard.remaining_seconds
 
 
 def is_risk_control_error(message) -> bool:
@@ -81,6 +156,9 @@ class AccountGuard:
             f"【{self.cookie_id}】命中平台风控，暂停主动请求 {cooldown} 秒"
             f"（连续第 {self.consecutive_hits} 次）: {self.last_hit_reason[:80]}"
         )
+        # RGV587 是网关/IP 级惩罚：只停当前账号，其他账号继续请求会把整个
+        # 出口 IP 继续按在地上。全局熔断必须与账号熔断同时生效。
+        global_guard.trip(self.cookie_id, self.last_hit_reason)
         return cooldown
 
     def reset(self) -> None:
@@ -166,6 +244,12 @@ async def guarded_call(cookie_id: str, coro_factory):
         RiskControlBlocked: 账号处于冷却期。
     """
     guard = registry.get(cookie_id)
+    if global_guard.is_blocked:
+        raise RiskControlBlocked(
+            cookie_id,
+            global_guard.remaining_seconds,
+            f"全局出口 IP 风控: {global_guard.last_hit_reason}",
+        )
     if guard.is_blocked:
         raise RiskControlBlocked(
             cookie_id, guard.remaining_seconds, guard.last_hit_reason
@@ -179,4 +263,5 @@ async def guarded_call(cookie_id: str, coro_factory):
             guard.trip(str(exc))
         raise
     guard.reset()
+    global_guard.reset(cookie_id)
     return result

@@ -86,6 +86,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             return
         
         # 持续接收客户端消息
+        # 截图是远端人工验证最重的 CPU 开销。每个 mouse.move 都截一次会把
+        # 2 核服务器拖满，真人拖动也被拉成秒级而被 nc 判机器；这里限频回传。
+        last_screenshot_at = 0.0
         while True:
             data = await websocket.receive_json()
             msg_type = data.get('type')
@@ -130,10 +133,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                                     'screenshot': screenshot
                                 })
                     else:
-                        # 按下或移动时，实时更新截图（截取整个验证码容器）
+                        # 按下立即回传一帧；移动时最多 8 FPS，避免截图挤占 CDP
+                        # 鼠标事件的处理时间。松手时会再回传最终结果。
                         if event_type in ['down', 'move']:
-                            # 截取整个验证码容器，降低质量换取速度
-                            screenshot = await captcha_controller.update_screenshot(session_id, quality=30)
+                            now = time.monotonic()
+                            if event_type == 'move' and now - last_screenshot_at < 0.125:
+                                continue
+                            screenshot = await captcha_controller.update_screenshot(
+                                session_id, quality=45
+                            )
+                            last_screenshot_at = time.monotonic()
                             if screenshot:
                                 await websocket.send_json({
                                     'type': 'screenshot_update',

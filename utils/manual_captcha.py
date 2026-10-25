@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -170,35 +171,61 @@ async def open_manual_session(
     }
 
     playwright = None
-    browser = None
     context = None
     refresh_task = None
+    browser_slot_held = False
     try:
         playwright = await async_playwright().start()
-        browser = await browser_limit.launch_browser(
-            playwright,
-            {'headless': headless,
-             # 只用完整版 Chromium。headless=True 默认会去找单独下载的
-             # chromium_headless_shell，缺失时报 Executable doesn't exist，
-             # 人工验证页面就会卡在「正在服务器上打开验证页面」。
-             'channel': 'chromium',
-             'args': [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ]},
-            "人工验证码",
+
+        # 人工验证必须与自动滑块共用全局浏览器槽位，否则两套浏览器同时抢 CPU，
+        # 拖动时间轴被拉长后真人操作也会被判定为机器。
+        await asyncio.to_thread(browser_limit.acquire_slot, "人工验证码")
+        browser_slot_held = True
+
+        # 正式版 Chrome + 持久化 profile 是上游实测结论：Playwright Chromium
+        # 的二进制指纹会被阿里 nc 识别，即使真人拖动也容易失败。人工验证使用
+        # 独立的 manual_* profile，避免和同步自动滑块的 slider_* profile抢锁。
+        user_data_dir = os.path.join(
+            os.getcwd(), "browser_data", f"manual_{cookie_id}"
         )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=CHROME_UA,
-        )
+        os.makedirs(user_data_dir, exist_ok=True)
+        launch_args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        context_options = {
+            "viewport": {"width": 1280, "height": 800},
+            "user_agent": CHROME_UA,
+        }
+        try:
+            context = await playwright.chromium.launch_persistent_context(
+                user_data_dir,
+                channel="chrome",
+                headless=headless,
+                args=launch_args,
+                **context_options,
+            )
+            logger.info(f"【{cookie_id}】人工验证已启动系统正式版 Chrome（持久化目录）")
+        except Exception as chrome_error:
+            logger.warning(
+                f"【{cookie_id}】系统 Chrome 不可用（{chrome_error}），"
+                "人工验证回退 Chromium"
+            )
+            context = await playwright.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=headless,
+                args=launch_args,
+                **context_options,
+            )
 
         if cookies_str:
             await context.add_cookies(_to_playwright_cookies(cookies_str))
 
-        page = await context.new_page()
+        page = context.pages[0] if context.pages else await context.new_page()
 
         # 惩罚页 URL 优先：只有导航到它才会弹出滑块。
         # 原实现导航到闲鱼首页，首页没有滑块 → check_completion 立刻误判
@@ -240,7 +267,7 @@ async def open_manual_session(
 
         logger.warning(
             f"【{cookie_id}】已开启人工验证会话，请在 {timeout} 秒内于"
-            f" /static/captcha_control.html?session={session_id} 完成验证"
+            f"账号页的「人工验证」弹窗中完成拖动"
         )
 
         # 关键：会话期间浏览器必须保持存活，等用户拖完才返回。
@@ -285,12 +312,13 @@ async def open_manual_session(
             await captcha_controller.close_session(session_id)
         except Exception:
             pass
-        for closer in (context, browser):
-            if closer is not None:
-                try:
-                    await closer.close()
-                except Exception:
-                    pass
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser_slot_held:
+            browser_limit.release_slot("人工验证码")
         if playwright is not None:
             try:
                 await playwright.stop()

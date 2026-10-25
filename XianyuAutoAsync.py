@@ -3200,6 +3200,14 @@ class XianyuLive:
 
             # 风控冷却期内不再尝试刷新 —— 持续请求会让风控一直不解除
             from utils import risk_control
+            if risk_control.is_globally_blocked():
+                remaining = risk_control.global_remaining_seconds()
+                logger.warning(
+                    f"【{self.cookie_id}】全局出口 IP 处于风控冷却期"
+                    f"（剩余 {remaining} 秒），跳过本次 Token 刷新"
+                )
+                self.last_token_refresh_status = "global_risk_control_blocked"
+                return None
             guard = risk_control.registry.get(self.cookie_id)
             if guard.is_blocked:
                 logger.warning(
@@ -3401,6 +3409,7 @@ class XianyuLive:
                                 self.needs_relogin = False
                                 self.relogin_reason = ''
                                 risk_control.registry.get(self.cookie_id).reset()
+                                risk_control.global_guard.reset(self.cookie_id)
                                 return new_token
 
                     # 检查是否需要滑块验证
@@ -4052,16 +4061,22 @@ class XianyuLive:
                     if hasattr(self, 'user_id') and self.user_id:
                         current_user_id = self.user_id
 
-                    # 使用 update_cookie_account_info 避免覆盖其他字段（如 username, password, pause_duration, remark 等）
-                    # 这个方法会自动处理新账号和现有账号的情况，不会覆盖账号密码
+                    # 运行期只允许更新已有账号：账号被用户删除后，旧任务不能
+                    # 把内存 Cookie 重新 INSERT 回数据库（否则会出现“删除后复活”）。
+                    # 同时拒绝残缺 Cookie 覆盖完整登录态。
                     success = db_manager.update_cookie_account_info(
-                        self.cookie_id, 
+                        self.cookie_id,
                         cookie_value=self.cookies_str,
-                        user_id=current_user_id  # 如果是新账号，需要提供user_id
+                        user_id=current_user_id,
+                        allow_create=False,
+                        allow_cookie_regression=False,
                     )
                     if not success:
                         # 如果更新失败，记录错误但不使用 save_cookie（避免覆盖账号密码）
-                        logger.warning(f"更新Cookie到数据库失败: {self.cookie_id}，但不使用save_cookie避免覆盖账号密码")
+                        logger.warning(
+                            f"拒绝更新Cookie到数据库: {self.cookie_id}"
+                            "（账号可能已删除，或新Cookie缺少关键登录字段）"
+                        )
                     else:
                         logger.warning(f"已更新Cookie到数据库: {self.cookie_id}")
                 except Exception as e:
@@ -12734,7 +12749,15 @@ class XianyuLive:
                     from utils import risk_control
 
                     guard = risk_control.registry.get(self.cookie_id)
-                    if guard.is_blocked:
+                    if risk_control.is_globally_blocked():
+                        global_remaining = risk_control.global_remaining_seconds()
+                        retry_delay = max(global_remaining + 5, 60)
+                        logger.warning(
+                            f"【{self.cookie_id}】全局出口 IP 风控冷却中，"
+                            f"将在 {retry_delay} 秒后重试连接"
+                            f"（全局冷却剩余 {global_remaining} 秒）"
+                        )
+                    elif guard.is_blocked:
                         retry_delay = max(guard.remaining_seconds + 5, 60)
                         logger.warning(
                             f"【{self.cookie_id}】风控冷却中，将在 {retry_delay} 秒后重试连接"

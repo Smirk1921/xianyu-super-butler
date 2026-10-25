@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """fresh-captcha-url 端点的熔断解除接线测试。
 
-用户手动过完滑块后「账号卡片迟迟不恢复」的根因：服务端仍按冷却期拒绝一切
-主动请求，令牌永远拿不到，「请求成功 → 解除熔断」这条链走不通。修复=端点
-拿到 punish 链接时立即 reset 该账号熔断，让心跳恢复探测。本测试锁住这条
-接线，防止将来重构时悄悄断掉。
+只拿到 punish 链接不代表风控解除：x5sec 仍留在用户浏览器里，服务端尚未拿到
+通行凭证。此前端点一拿到 URL 就 reset 熔断，心跳/自动滑块立刻恢复，把全局
+出口 IP 的 RGV587 惩罚越打越长。现在只有在响应包含 accessToken（平台确认
+放行）时才解除账号与全局熔断。
 """
 import asyncio
 import unittest
@@ -49,14 +49,14 @@ class FreshCaptchaUnblockTests(unittest.TestCase):
             ))
         return result, registry, guard
 
-    def test_punish_link_clears_risk_block(self):
+    def test_punish_link_does_not_clear_risk_block(self):
+        """仅取得惩罚 URL 不解除熔断，避免自动重试风暴。"""
         result, registry, guard = self._run({
             'data': {'url': 'https://login.taobao.com/jump?punish=x5secdata&action=captcha'},
         })
         self.assertTrue(result['need_verify'], result)
         self.assertIn('punish', result['verification_url'])
-        registry.get.assert_called_once_with('cid-1')
-        guard.reset.assert_called_once()
+        guard.reset.assert_not_called()
 
     def test_already_recovered_clears_risk_block(self):
         """令牌接口给了 accessToken 说明风控已解除，本地冷却也要清掉。"""

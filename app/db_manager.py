@@ -2409,12 +2409,14 @@ class DBManager:
 
     
     def delete_cookie(self, cookie_id: str) -> bool:
-        """从数据库删除Cookie及其关键字"""
+        """从数据库删除Cookie及其关键字、启用状态。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 # 删除关联的关键字
                 self._execute_sql(cursor, "DELETE FROM keywords WHERE cookie_id = ?", (cookie_id,))
+                # 启用状态不能残留，否则同名账号重新导入时会继承旧状态
+                self._execute_sql(cursor, "DELETE FROM cookie_status WHERE cookie_id = ?", (cookie_id,))
                 # 删除Cookie
                 self._execute_sql(cursor, "DELETE FROM cookies WHERE id = ?", (cookie_id,))
                 self.conn.commit()
@@ -2642,19 +2644,64 @@ class DBManager:
                 logger.error(f"获取账号自动回复暂停时间失败: {e}")
                 return 10
 
-    def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None) -> bool:
-        """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）
-        如果记录不存在，会先创建记录（需要提供cookie_value和user_id）
+    @staticmethod
+    def _cookie_field_names(cookie_value: str) -> set:
+        """从 Cookie 字符串提取小写字段名集合。"""
+        return {
+            part.split('=', 1)[0].strip().lower()
+            for part in (cookie_value or '').split(';')
+            if '=' in part and part.split('=', 1)[0].strip()
+        }
+
+    @classmethod
+    def _would_lose_critical_cookie_fields(cls, old_value: str, new_value: str) -> bool:
+        """判断一次 Cookie 覆盖是否会把关键登录字段弄丢。
+
+        人工验证/删除后的残留任务曾经把 26 字段的完整 Cookie 覆盖成
+        11 字段的挑战 Cookie，直接导致账号永久拿不到 token。运行期写库
+        必须拒绝这种回退；显式重新登录得到更完整的 Cookie 不受影响。
+        """
+        critical_fields = ('_m_h5_tk', 'cookie2', 'sgcookie')
+        old_fields = cls._cookie_field_names(old_value)
+        new_fields = cls._cookie_field_names(new_value)
+        return any(field in old_fields and field not in new_fields for field in critical_fields)
+
+    def update_cookie_account_info(
+        self,
+        cookie_id: str,
+        cookie_value: str = None,
+        username: str = None,
+        password: str = None,
+        show_browser: bool = None,
+        user_id: int = None,
+        allow_create: bool = True,
+        allow_cookie_regression: bool = False,
+    ) -> bool:
+        """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）。
+
+        ``allow_create=False`` 供运行中的 XianyuLive 写库使用：账号已被删除时
+        绝不能把内存里的旧 Cookie 重新 INSERT 回去。``allow_cookie_regression=False``
+        会拒绝“完整 Cookie 被残缺 Cookie 覆盖”的写操作。
         """
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                
+
                 # 检查记录是否存在
-                self._execute_sql(cursor, "SELECT id FROM cookies WHERE id = ?", (cookie_id,))
-                exists = cursor.fetchone() is not None
-                
+                self._execute_sql(
+                    cursor,
+                    "SELECT value FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
+                existing_row = cursor.fetchone()
+                exists = existing_row is not None
+
                 if not exists:
+                    if not allow_create:
+                        logger.warning(
+                            f"账号 {cookie_id} 已删除，拒绝运行期任务重新创建记录"
+                        )
+                        return False
                     # 记录不存在，需要创建新记录
                     if cookie_value is None:
                         logger.warning(f"账号 {cookie_id} 不存在，且未提供cookie_value，无法创建新记录")
@@ -2694,7 +2741,22 @@ class DBManager:
                     return True
                 else:
                     # 记录存在，执行更新
-                    # 构建动态SQL更新语句
+                    if (
+                        cookie_value is not None
+                        and not allow_cookie_regression
+                        and self._would_lose_critical_cookie_fields(
+                            existing_row[0] or '', cookie_value
+                        )
+                    ):
+                        old_fields = self._cookie_field_names(existing_row[0] or '')
+                        new_fields = self._cookie_field_names(cookie_value)
+                        logger.warning(
+                            f"账号 {cookie_id} 的新 Cookie 缺少关键登录字段"
+                            f"（旧 {len(old_fields)} 字段 -> 新 {len(new_fields)} 字段），拒绝覆盖"
+                        )
+                        return False
+
+                    # 构造动态SQL更新语句
                     update_fields = []
                     params = []
                     

@@ -141,8 +141,14 @@ class XianyuSellerAPI:
             raise SellerApiError(api, ["Cookie 为空，无法调用卖家端接口"])
 
         last_ret: List[str] = []
-        # 熔断：账号处于风控冷却期时直接放弃，继续请求只会延长风控
+        # 熔断：账号或同一出口 IP 处于风控冷却期时直接放弃，继续请求只会延长风控
         guard = risk_control.registry.get(self.cookie_id)
+        if not self.ignore_risk_control and risk_control.is_globally_blocked():
+            raise risk_control.RiskControlBlocked(
+                self.cookie_id,
+                risk_control.global_remaining_seconds(),
+                f"全局出口 IP 风控: {risk_control.global_guard.last_hit_reason}",
+            )
         if guard.is_blocked and not self.ignore_risk_control:
             raise risk_control.RiskControlBlocked(
                 self.cookie_id, guard.remaining_seconds, guard.last_hit_reason

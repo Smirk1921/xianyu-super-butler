@@ -10774,6 +10774,7 @@ async def start_manual_captcha(
             from utils import risk_control
 
             risk_control.registry.get(cookie_id).reset()
+            risk_control.global_guard.reset(cookie_id)
         except Exception as exc:
             log_with_user('warning', f"重置风控状态失败: {exc}", current_user)
         log_with_user('info', f"账号 {cookie_id} 人工验证完成，已更新 Cookie", current_user)
@@ -10944,6 +10945,7 @@ async def get_fresh_captcha_url(
         # 否则心跳仍会被冷却期挡住，账号看起来一直没恢复。
         from utils import risk_control
         risk_control.registry.get(cookie_id).reset()
+        risk_control.global_guard.reset(cookie_id)
         log_with_user('info', f'账号 {cookie_id} 风控已解除，无需验证', current_user)
         return {
             'success': True,
@@ -10954,11 +10956,9 @@ async def get_fresh_captcha_url(
     url = data.get('url') or ''
     if url and ('punish' in url or 'action=captcha' in url):
         log_with_user('info', f'账号 {cookie_id} 已取得新的验证链接', current_user)
-        # 用户马上要去浏览器手动过滑块：提前解除熔断，让心跳恢复令牌探测。
-        # 否则滑块验证通过了，服务端仍按冷却期拒绝一切请求，账号卡片上的
-        # 「滑块验证 · N 分钟」要干等冷却自然到期才消失 —— 看起来就像验证白做了。
-        from utils import risk_control
-        risk_control.registry.get(cookie_id).reset()
+        # 只拿到惩罚 URL 不代表风控解除，绝不能 reset 熔断：
+        # 之前这里一 reset，心跳/自动滑块立刻恢复，把全局出口 IP 的惩罚越打越长。
+        # 熔断只在 accessToken 或人工验证成功合并 x5sec 后解除。
         return {
             'success': True,
             'need_verify': True,

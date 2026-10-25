@@ -62,34 +62,52 @@ class CaptchaRemoteController:
             'viewport': self.active_sessions[session_id]['viewport']
         }
     
+    async def _captcha_clip(self, page: Page, captcha_info: Dict[str, Any]) -> Dict[str, float]:
+        """把验证码容器加边距后限制在视口内，避免 Playwright clip 越界报错。"""
+        viewport = page.viewport_size
+        if viewport is None:
+            try:
+                viewport = await page.evaluate(
+                    "() => ({width: window.innerWidth, height: window.innerHeight})"
+                )
+            except Exception:
+                viewport = {'width': 1280, 'height': 800}
+
+        viewport_width = int(viewport.get('width') or 1280)
+        viewport_height = int(viewport.get('height') or 800)
+        x = max(0.0, float(captcha_info['x']) - 10.0)
+        y = max(0.0, float(captcha_info['y']) - 10.0)
+        width = min(
+            float(captcha_info['width']) + 20.0,
+            max(1.0, viewport_width - x),
+        )
+        height = min(
+            # 滑块条本身只有 34px；上下多留一点给提示文字，但不越过视口。
+            float(captcha_info['height']) + 36.0,
+            max(1.0, viewport_height - y),
+        )
+        return {'x': x, 'y': y, 'width': width, 'height': height}
+
     async def _screenshot_captcha_area(self, page: Page, captcha_info: Dict[str, Any]) -> bytes:
         """截取整个验证码容器区域"""
         try:
             if captcha_info and 'x' in captcha_info:
-                # 直接截取整个容器，稍微留一点边距
-                x = max(0, captcha_info['x'] - 10)
-                y = max(0, captcha_info['y'] - 10)
-                width = captcha_info['width'] + 20
-                height = captcha_info['height'] + 20
-                
-                # 截取整个验证码容器
+                clip = await self._captcha_clip(page, captcha_info)
                 screenshot_bytes = await page.screenshot(
                     type='jpeg',
                     quality=80,  # 验证码区域用高质量
-                    clip={
-                        'x': x,
-                        'y': y,
-                        'width': width,
-                        'height': height
-                    }
+                    clip=clip,
                 )
-                logger.info(f"✅ 截取验证码容器: {width}x{height} (包含完整验证码)")
+                logger.info(
+                    f"✅ 截取验证码容器: {clip['width']:.0f}x{clip['height']:.0f}"
+                    f" @({clip['x']:.0f},{clip['y']:.0f})"
+                )
                 return screenshot_bytes
             else:
                 # 如果没有找到滑块，截取整个页面
                 logger.warning("未找到滑块位置，截取整个页面")
                 return await page.screenshot(type='jpeg', quality=75, full_page=False)
-                
+
         except Exception as e:
             logger.warning(f"截取滑块区域失败，使用全页面: {e}")
             return await page.screenshot(type='jpeg', quality=75, full_page=False)
@@ -111,7 +129,9 @@ class CaptchaRemoteController:
                     element = await page.query_selector(selector)
                     if element:
                         box = await element.bounding_box()
-                        if box and box['width'] > 100 and box['height'] > 100:  # 确保找到的是容器
+                        # 阿里 nc 的 #nocaptcha/.nc-container 是 1280x34 的扁条，
+                        # 不能用 height>100 过滤，否则永远找不到容器。
+                        if box and box['width'] >= 200 and box['height'] >= 20:
                             logger.info(f"✅ 在主页面找到验证码容器: {selector}, 大小: {box['width']}x{box['height']}")
                             return {
                                 'selector': selector,
@@ -134,7 +154,7 @@ class CaptchaRemoteController:
                             element = await frame.query_selector(selector)
                             if element:
                                 box = await element.bounding_box()
-                                if box and box['width'] > 100 and box['height'] > 100:
+                                if box and box['width'] >= 200 and box['height'] >= 20:
                                     logger.info(f"✅ 在iframe找到验证码容器: {selector}, 大小: {box['width']}x{box['height']}")
                                     return {
                                         'selector': selector,
@@ -167,15 +187,11 @@ class CaptchaRemoteController:
             
             # 截取整个验证码容器
             if captcha_info and 'x' in captcha_info:
-                x = max(0, captcha_info['x'] - 10)
-                y = max(0, captcha_info['y'] - 10)
-                width = captcha_info['width'] + 20
-                height = captcha_info['height'] + 20
-                
+                clip = await self._captcha_clip(page, captcha_info)
                 screenshot_bytes = await page.screenshot(
                     type='jpeg',
                     quality=quality,
-                    clip={'x': x, 'y': y, 'width': width, 'height': height}
+                    clip=clip,
                 )
             else:
                 # 降级方案：截取整个页面

@@ -5,6 +5,9 @@ from unittest.mock import AsyncMock, patch
 from app.cookie_manager import CookieManager
 
 
+VALID_COOKIE = "_m_h5_tk=tk; cookie2=c2; sgcookie=sg; unb=1"
+
+
 class CookieTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.db_patch = patch("app.cookie_manager.db_manager")
@@ -28,35 +31,35 @@ class CookieTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.db_patch.stop()
 
     async def test_new_account_task_is_registered(self):
-        task = await self.manager._ensure_cookie_task_async("account-1", "cookie")
+        task = await self.manager._ensure_cookie_task_async("account-1", VALID_COOKIE)
 
         self.assertIs(task, self.manager.tasks["account-1"])
         self.assertEqual(self.manager.get_task_state("account-1"), "running")
 
     async def test_running_task_can_be_restarted(self):
-        first_task = await self.manager._ensure_cookie_task_async("account-1", "cookie")
+        first_task = await self.manager._ensure_cookie_task_async("account-1", VALID_COOKIE)
         second_task = await self.manager._ensure_cookie_task_async(
-            "account-1", "new-cookie", restart=True
+            "account-1", VALID_COOKIE + "; new=1", restart=True
         )
 
         self.assertTrue(first_task.cancelled())
         self.assertIs(second_task, self.manager.tasks["account-1"])
-        self.assertEqual(self.manager.cookies["account-1"], "new-cookie")
+        self.assertEqual(self.manager.cookies["account-1"], VALID_COOKIE + "; new=1")
 
     async def test_disabled_account_updates_cookie_without_starting(self):
         self.manager.cookie_status["account-1"] = False
 
-        task = await self.manager._ensure_cookie_task_async("account-1", "cookie")
+        task = await self.manager._ensure_cookie_task_async("account-1", VALID_COOKIE)
 
         self.assertIsNone(task)
         self.assertNotIn("account-1", self.manager.tasks)
-        self.assertEqual(self.manager.cookies["account-1"], "cookie")
+        self.assertEqual(self.manager.cookies["account-1"], VALID_COOKIE)
 
     async def test_completed_task_can_start_again(self):
         completed = asyncio.create_task(asyncio.sleep(0))
         await completed
         self.manager.tasks["account-1"] = completed
-        self.manager.cookies["account-1"] = "cookie"
+        self.manager.cookies["account-1"] = VALID_COOKIE
 
         restarted = await self.manager._ensure_cookie_task_async("account-1")
 

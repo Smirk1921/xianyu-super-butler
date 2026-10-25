@@ -786,15 +786,20 @@ async def main():
     print("CookieManager 创建完成")
 
     # 1) 从数据库加载的 Cookie 已经在 CookieManager 初始化时完成
-    # 为每个启用的 Cookie 启动任务
+    # 为每个启用的 Cookie 启动任务。多账号共享同一出口 IP，重启后同时刷新
+    # Token 会触发 RGV587；这里按账号顺序错峰启动。
+    STARTUP_STAGGER_SECONDS = 90
+    startup_index = 0
     for cid, val in manager.cookies.items():
         # 检查账号是否启用
         if not manager.get_cookie_status(cid):
             logger.info(f"跳过禁用的 Cookie: {cid}")
             continue
 
+        startup_delay = startup_index * STARTUP_STAGGER_SECONDS
+        startup_index += 1
         try:
-            await manager._ensure_cookie_task_async(cid, val)
+            await manager._ensure_cookie_task_async(cid, val, startup_delay=startup_delay)
         except Exception as e:
             logger.error(f"启动 Cookie 任务失败: {cid}, {e}")
             import traceback

@@ -8,6 +8,20 @@ from app.db_manager import db_manager
 __all__ = ["CookieManager", "manager"]
 
 
+# 缺任一字段就不再启动监听任务。历史事故中残缺 Cookie 只有 11 个字段、
+# 没有 _m_h5_tk，仍反复刷新 Token/滑块，把整个出口 IP 打进 RGV587 风控。
+REQUIRED_COOKIE_FIELDS = ("_m_h5_tk", "cookie2")
+
+
+def missing_required_cookie_fields(cookie_value: str) -> tuple:
+    fields = {
+        part.split("=", 1)[0].strip().lower()
+        for part in (cookie_value or "").split(";")
+        if "=" in part and part.split("=", 1)[0].strip()
+    }
+    return tuple(field for field in REQUIRED_COOKIE_FIELDS if field not in fields)
+
+
 class CookieManager:
     """管理多账号 Cookie 及其对应的 XianyuLive 任务和关键字"""
 
@@ -19,6 +33,8 @@ class CookieManager:
         self.keywords: Dict[str, List[Tuple[str, str]]] = {}
         self.cookie_status: Dict[str, bool] = {}  # 账号启用状态
         self.auto_confirm_settings: Dict[str, bool] = {}  # 自动确认发货设置
+        # cookie_id -> 缺失的关键字段。启动前拦截，避免残缺 Cookie 打风控接口。
+        self.invalid_cookies: Dict[str, tuple] = {}
         self._task_locks: Dict[str, asyncio.Lock] = {}  # 每个cookie_id的任务锁，防止重复创建
         self._load_from_db()
 
@@ -33,10 +49,18 @@ class CookieManager:
             self.cookie_status = db_manager.get_all_cookie_status()
             # 加载所有auto_confirm设置
             self.auto_confirm_settings = {}
-            for cookie_id in self.cookies.keys():
+            self.invalid_cookies = {}
+            for cookie_id, cookie_value in self.cookies.items():
                 # 为没有状态记录的Cookie设置默认启用状态
                 if cookie_id not in self.cookie_status:
                     self.cookie_status[cookie_id] = True
+                missing_fields = missing_required_cookie_fields(cookie_value)
+                if missing_fields:
+                    self.invalid_cookies[cookie_id] = missing_fields
+                    logger.error(
+                        f"【{cookie_id}】Cookie 缺少关键字段 {list(missing_fields)}，"
+                        "账号标记为需重新登录，不会启动监听任务"
+                    )
                 # 加载auto_confirm设置
                 self.auto_confirm_settings[cookie_id] = db_manager.get_auto_confirm(cookie_id)
             logger.info(f"从数据库加载了 {len(self.cookies)} 个Cookie、{len(self.keywords)} 组关键字、{len(self.cookie_status)} 个状态记录和 {len(self.auto_confirm_settings)} 个自动确认设置")
@@ -59,11 +83,24 @@ class CookieManager:
         return True
 
     # ------------------------ 内部协程 ------------------------
-    async def _run_xianyu(self, cookie_id: str, cookie_value: str, user_id: int = None):
+    async def _run_xianyu(
+        self,
+        cookie_id: str,
+        cookie_value: str,
+        user_id: int = None,
+        startup_delay: float = 0.0,
+    ):
         """在事件循环中启动 XianyuLive.main"""
         logger.info(f"【{cookie_id}】_run_xianyu方法开始执行...")
 
         try:
+            if startup_delay > 0:
+                logger.info(
+                    f"【{cookie_id}】启动错峰延迟 {startup_delay:.0f} 秒，"
+                    "避免容器重启后多账号同时请求 Token"
+                )
+                await asyncio.sleep(startup_delay)
+
             logger.info(f"【{cookie_id}】正在导入XianyuLive...")
             from XianyuAutoAsync import XianyuLive  # 延迟导入，避免循环
             logger.info(f"【{cookie_id}】XianyuLive导入成功")
@@ -142,6 +179,7 @@ class CookieManager:
         user_id: int = None,
         restart: bool = False,
         save_to_db: bool = False,
+        startup_delay: float = 0.0,
     ):
         """确保账号监听任务处于运行状态。"""
         if cookie_id not in self._task_locks:
@@ -150,6 +188,7 @@ class CookieManager:
         async with self._task_locks[cookie_id]:
             if cookie_value is not None:
                 self.cookies[cookie_id] = cookie_value
+                self.invalid_cookies.pop(cookie_id, None)
                 if save_to_db:
                     db_manager.save_cookie(cookie_id, cookie_value, user_id)
             else:
@@ -157,6 +196,16 @@ class CookieManager:
 
             if not cookie_value:
                 raise ValueError(f"Cookie值不存在，无法启动任务: {cookie_id}")
+
+            missing_fields = missing_required_cookie_fields(cookie_value)
+            if missing_fields:
+                self.invalid_cookies[cookie_id] = missing_fields
+                logger.error(
+                    f"【{cookie_id}】Cookie 缺少关键字段 {list(missing_fields)}，"
+                    "拒绝启动监听任务；请重新扫码/登录获取完整 Cookie"
+                )
+                return None
+            self.invalid_cookies.pop(cookie_id, None)
 
             cookie_info = db_manager.get_cookie_details(cookie_id)
             actual_user_id = user_id
@@ -184,7 +233,12 @@ class CookieManager:
                     logger.warning(f"【{cookie_id}】等待旧监听任务退出失败: {exc}")
 
             task = self.loop.create_task(
-                self._run_xianyu(cookie_id, cookie_value, actual_user_id),
+                self._run_xianyu(
+                    cookie_id,
+                    cookie_value,
+                    actual_user_id,
+                    startup_delay=startup_delay,
+                ),
                 name=f"xianyu-account-{cookie_id}",
             )
             self._register_task(cookie_id, task)
@@ -241,17 +295,29 @@ class CookieManager:
         self.cookies.pop(cookie_id, None)
         self.keywords.pop(cookie_id, None)
         self.instances.pop(cookie_id, None)
+        self.invalid_cookies.pop(cookie_id, None)
         self._task_locks.pop(cookie_id, None)
 
         # 同步落库：db_manager 自带线程锁，可以安全地在 HTTP 线程里调用
         db_manager.delete_cookie(cookie_id)
         logger.info(f"已移除账号: {cookie_id}")
 
-        if task is not None:
-            # 取消动作交给事件循环，不等结果。事件循环忙时会稍后处理，
-            # 账号此刻已从注册表和数据库消失，不会再被调度。
+        if task is not None and not task.done():
+            def _cancel_and_reap() -> None:
+                task.cancel()
+                # 再挂一个等待任务，避免卡在同步 CDP 调用里的旧任务还没退出时，
+                # 其他代码误以为账号仍在运行。数据库守卫已保证它无法复活记录。
+                async def _reap() -> None:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        logger.debug(f"【{cookie_id}】等待删除后的旧任务退出: {exc}")
+                self.loop.create_task(_reap(), name=f"reap-deleted-{cookie_id}")
+
             try:
-                self.loop.call_soon_threadsafe(task.cancel)
+                self.loop.call_soon_threadsafe(_cancel_and_reap)
             except Exception as exc:
                 logger.warning(f"【{cookie_id}】提交任务取消失败（已忽略）: {exc}")
 
@@ -264,6 +330,7 @@ class CookieManager:
         user_id: int = None,
         restart: bool = False,
         save_to_db: bool = False,
+        startup_delay: float = 0.0,
     ):
         """线程安全地确保账号监听任务运行。"""
         coroutine = self._ensure_cookie_task_async(
@@ -272,6 +339,7 @@ class CookieManager:
             user_id=user_id,
             restart=restart,
             save_to_db=save_to_db,
+            startup_delay=startup_delay,
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -287,6 +355,9 @@ class CookieManager:
 
     def get_task_state(self, cookie_id: str) -> str:
         """返回账号监听任务状态。"""
+        if cookie_id in self.invalid_cookies:
+            return "need_relogin"
+
         task = self.tasks.get(cookie_id)
         if not task:
             return "stopped"
