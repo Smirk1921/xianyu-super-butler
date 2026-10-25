@@ -3092,6 +3092,10 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
             account_id,
             cookie_value=cookies,
             user_id=user_id,
+            # 扫码确认接口本来就只返回 9 个核心会话字段，浏览器增强会在后台
+            # 补齐 _m_h5_tk 等 20+ 字段。这里必须显式允许这个受控的临时态，
+            # 否则“防残缺 Cookie 覆盖”保护会把正常扫码登录误判成回退。
+            allow_cookie_regression=True,
         )
     if not saved:
         raise RuntimeError("扫码Cookie保存失败")

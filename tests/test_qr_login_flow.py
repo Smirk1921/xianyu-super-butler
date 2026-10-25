@@ -34,6 +34,44 @@ class QrLoginFlowTests(unittest.IsolatedAsyncioTestCase):
         save_cookie.assert_called_once()
         manager.add_cookie.assert_called_once()
 
+    async def test_existing_account_qr_bootstrap_allows_temp_partial_cookie(self):
+        """扫码确认只给 9 个核心字段；保存阶段允许临时回退，后台增强会补齐。"""
+        manager = Mock()
+        manager.update_cookie.return_value = None
+        current_user = {"user_id": 7, "username": "tester"}
+        full_existing_cookie = (
+            "unb=account-1; _m_h5_tk=old-token; cookie2=old-c2; sgcookie=old-sg"
+        )
+        qr_cookie = "unb=account-1; cookie2=new-c2; sgcookie=new-sg"
+
+        with (
+            patch.object(
+                reply_server.db_manager,
+                "get_all_cookies",
+                return_value={"account-1": full_existing_cookie},
+            ),
+            patch.object(
+                reply_server.db_manager,
+                "update_cookie_account_info",
+                return_value=True,
+            ) as update_cookie,
+            patch.object(reply_server.cookie_manager, "manager", manager),
+        ):
+            result = await reply_server.process_qr_login_cookies(
+                qr_cookie,
+                "account-1",
+                current_user,
+            )
+
+        self.assertEqual(result["account_id"], "account-1")
+        self.assertFalse(result["is_new_account"])
+        self.assertEqual(result["cookie_field_count"], 3)
+        update_cookie.assert_called_once()
+        self.assertIn("allow_cookie_regression=True", repr(update_cookie.call_args))
+        manager.update_cookie.assert_called_once_with(
+            "account-1", qr_cookie, save_to_db=False
+        )
+
     async def test_mismatched_account_identifier_is_rejected_before_save(self):
         current_user = {"user_id": 7, "username": "tester"}
 
