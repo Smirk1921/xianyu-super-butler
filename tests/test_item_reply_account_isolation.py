@@ -31,8 +31,10 @@ def make_db():
 
 
 def insert_item_reply(db, cookie_id, item_id, reply_content):
+    # priority=0 才会进入 get_default_reply 的兜底分支；priority=1 的专属回复
+    # 在本分支的消息入口就已优先发送，不经过这里。
     db.conn.execute(
-        "INSERT INTO item_replay (item_id, cookie_id, reply_content) VALUES (?, ?, ?)",
+        "INSERT INTO item_replay (item_id, cookie_id, reply_content, priority) VALUES (?, ?, ?, 0)",
         (item_id, cookie_id, reply_content),
     )
     db.conn.commit()

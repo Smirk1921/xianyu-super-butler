@@ -5601,10 +5601,14 @@ class XianyuLive:
             #    priority=1 的专属回复已在消息处理入口直接处理）
             if item_id:
                 item_reply = db_manager.get_item_reply(self.cookie_id, item_id)
+                # 不能用 `priority or 1`：0 会被当成假值变成 1，
+                # 导致 priority=0 的兜底专属回复永远不生效。
+                priority_value = item_reply.get('priority') if item_reply else None
+                priority_value = 1 if priority_value is None else int(priority_value)
                 if (
                     item_reply
                     and item_reply.get('reply_content')
-                    and int(item_reply.get('priority') or 1) == 0
+                    and priority_value == 0
                 ):
                     reply_once = (
                         1 if item_reply.get('reply_once') is None
