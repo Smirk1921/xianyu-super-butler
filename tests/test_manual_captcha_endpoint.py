@@ -15,6 +15,8 @@ class ManualCaptchaRestartTests(unittest.IsolatedAsyncioTestCase):
         manager = Mock()
         manager.pause_cookie_task = AsyncMock(return_value=True)
         manager.ensure_cookie_task = Mock(return_value=None)
+        manager.get_cookie_status.return_value = False
+        manager.update_cookie_status = Mock(return_value=None)
         guard = Mock()
         guard.is_blocked = True
         guard.remaining_seconds = 120
@@ -60,6 +62,7 @@ class ManualCaptchaRestartTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             manager.ensure_cookie_task.call_args.kwargs['save_to_db'], False
         )
+        manager.update_cookie_status.assert_called_once_with(cookie_id, True)
 
 
 if __name__ == '__main__':

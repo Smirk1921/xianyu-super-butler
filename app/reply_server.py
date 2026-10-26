@@ -10829,11 +10829,18 @@ async def start_manual_captcha(
         except Exception as exc:
             log_with_user('warning', f"重置风控状态失败: {exc}", current_user)
 
-        # 人工验证开始前已暂停旧任务；验证成功后必须按账号启用状态恢复，
-        # 否则界面显示“验证完成”，账号却因为没有监听任务仍然不运行。
+        # 人工验证开始前已暂停旧任务；验证成功后恢复监听。用户点“人工验证”
+        # 本身就是恢复账号的意图，所以即使之前处于停用状态也一并重新启用。
         try:
             manager = cookie_manager.manager
             if manager is not None:
+                if not manager.get_cookie_status(cookie_id):
+                    manager.update_cookie_status(cookie_id, True)
+                    log_with_user(
+                        'info',
+                        f"账号 {cookie_id} 人工验证成功后已重新启用",
+                        current_user,
+                    )
                 manager.ensure_cookie_task(
                     cookie_id,
                     merged_cookies,
