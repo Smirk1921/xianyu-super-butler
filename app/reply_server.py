@@ -10756,31 +10756,36 @@ async def start_manual_captcha(
     if cookie_id not in user_cookies:
         raise HTTPException(status_code=404, detail="账号不存在或无权访问")
 
-    guard = risk_control.registry.get(cookie_id)
-    if not guard.is_blocked:
-        raise HTTPException(
-            status_code=409,
-            detail="该账号当前不处于风控状态，无需人工验证",
-        )
+    # 不要用进程内 guard.is_blocked 作为唯一门禁：冷却到期后 guard 会自然
+    # 解除，但平台风控仍在，界面仍显示滑块。此时用户点“人工验证”不该被
+    # 409 拒绝。open_manual_session 会实时请求 Token；真没有滑块时它会
+    # 返回“未找到惩罚 URL”，不会白开 300 秒浏览器。
 
-    # 暂停该账号的自动 Token 刷新/滑块循环。自动滑块和人工验证共用
-    # browser_limit 全局信号量（默认 3 槽位），自动滑块占满槽位后人工验证
-    # 会在 launch_browser 里等 300 秒超时，前端弹窗就卡在白屏 loading。
-    _instance = None
+    # 自动滑块和人工验证共用全局浏览器槽位。仅设置 manual 标志不够：
+    # 旧任务若正卡在同步滑块线程里，仍会占着槽位让弹窗白等 300 秒。
+    # 直接暂停监听任务，人工验证结束后再按账号启用状态恢复。
     if cookie_manager.manager is not None:
-        _instance = cookie_manager.manager.instances.get(cookie_id)
-        if _instance is not None:
-            _instance.manual_captcha_in_progress = True
-            log_with_user('info', f"账号 {cookie_id} 已暂停自动验证，等待人工完成", current_user)
+        try:
+            await cookie_manager.manager.pause_cookie_task(cookie_id)
+            log_with_user(
+                'info',
+                f"账号 {cookie_id} 已暂停自动验证，浏览器槽位已释放",
+                current_user,
+            )
+        except Exception as pause_error:
+            log_with_user(
+                'warning',
+                f"暂停自动验证失败，继续尝试人工验证: {pause_error}",
+                current_user,
+            )
 
     try:
         timeout = max(60, min(int(timeout or 300), 900))
         result = await open_manual_session(
             cookie_id, user_cookies[cookie_id], timeout=timeout
         )
-    finally:
-        if _instance is not None:
-            _instance.manual_captcha_in_progress = False
+    except Exception:
+        raise
 
     if result['success']:
         # 拿到 x5sec 后必须清掉 x5secdata 等挑战标记，否则闲鱼会认为验证仍未完成，
@@ -10823,6 +10828,26 @@ async def start_manual_captcha(
             risk_control.global_guard.reset(cookie_id)
         except Exception as exc:
             log_with_user('warning', f"重置风控状态失败: {exc}", current_user)
+
+        # 人工验证开始前已暂停旧任务；验证成功后必须按账号启用状态恢复，
+        # 否则界面显示“验证完成”，账号却因为没有监听任务仍然不运行。
+        try:
+            manager = cookie_manager.manager
+            if manager is not None:
+                manager.ensure_cookie_task(
+                    cookie_id,
+                    merged_cookies,
+                    user_id=current_user['user_id'],
+                    restart=True,
+                    save_to_db=False,
+                )
+                log_with_user('info', f"账号 {cookie_id} 人工验证后监听任务已恢复", current_user)
+        except Exception as exc:
+            log_with_user(
+                'warning',
+                f"人工验证成功但恢复监听任务失败: {exc}",
+                current_user,
+            )
         log_with_user('info', f"账号 {cookie_id} 人工验证完成，已更新 Cookie", current_user)
 
     return JSONResponse({
