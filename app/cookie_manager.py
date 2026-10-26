@@ -323,6 +323,33 @@ class CookieManager:
 
         return True
 
+    async def pause_cookie_task(self, cookie_id: str, timeout: float = 20.0) -> bool:
+        """暂停账号监听任务但不删除数据，供扫码重登期间使用。
+
+        扫码确认只返回 9 个核心字段，必须再开浏览器访问 /im 补全。若此时
+        旧实例或新实例仍占着全局浏览器槽位，增强会等满 300 秒并留下残缺
+        Cookie，账号就表现为“扫码成功但无法运行”。
+        """
+        lock = self._task_locks.setdefault(cookie_id, asyncio.Lock())
+        async with lock:
+            task = self.tasks.pop(cookie_id, None)
+            self.instances.pop(cookie_id, None)
+            if task is None or task.done():
+                return True
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"【{cookie_id}】暂停监听任务超时（{timeout} 秒），"
+                    "继续扫码流程"
+                )
+            except Exception as exc:
+                logger.warning(f"【{cookie_id}】暂停监听任务异常: {exc}")
+            return True
+
     def ensure_cookie_task(
         self,
         cookie_id: str,

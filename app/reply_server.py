@@ -3006,6 +3006,7 @@ async def _process_qr_login_session(
             current_user
         )
         manager_operation = account_info.pop('_manager_operation', None)
+        previous_cookie = account_info.pop('_previous_cookie', None)
         result = {
             'status': 'success',
             'account_ready': True,
@@ -3031,6 +3032,7 @@ async def _process_qr_login_session(
             cookies=cookies_info['cookies'],
             current_user=current_user,
             manager_operation=manager_operation,
+            previous_cookie=previous_cookie,
         )
     except Exception as exc:
         result = {
@@ -3078,12 +3080,31 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
 
     account_id = existing_account_id or normalized_unb
     is_new_account = existing_account_id is None
+    previous_cookie = existing_cookies.get(existing_account_id) if existing_account_id else None
     if is_new_account:
         counter = 1
         original_account_id = account_id
         while account_id in existing_cookies:
             account_id = f"{original_account_id}_{counter}"
             counter += 1
+
+    # 已有账号扫码重登必须先停掉旧监听任务，否则旧实例会在后台继续占用
+    # 浏览器槽位/发起 Token 请求，扫码增强等不到浏览器就会留下 9 字段残缺 Cookie。
+    if not is_new_account and cookie_manager.manager:
+        try:
+            await cookie_manager.manager.pause_cookie_task(account_id)
+            log_with_user(
+                'info',
+                f"扫码重登已暂停旧监听任务: 账号={account_id}",
+                current_user,
+            )
+        except Exception as pause_error:
+            log_with_user(
+                'warning',
+                f"暂停旧监听任务失败，继续扫码保存: 账号={account_id}, "
+                f"异常类型={type(pause_error).__name__}",
+                current_user,
+            )
 
     if is_new_account:
         saved = db_manager.save_cookie(account_id, cookies, user_id)
@@ -3100,21 +3121,8 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
     if not saved:
         raise RuntimeError("扫码Cookie保存失败")
 
-    manager_operation = None
-    if cookie_manager.manager:
-        if is_new_account:
-            manager_operation = cookie_manager.manager.add_cookie(
-                account_id,
-                cookies,
-                user_id=user_id,
-            )
-        else:
-            manager_operation = cookie_manager.manager.update_cookie(
-                account_id,
-                cookies,
-                save_to_db=False,
-            )
-
+    # 不在保存阶段启动监听任务。必须等后台增强拿到完整 Cookie 后再启动，
+    # 否则半成品实例会占着浏览器槽位并反复触发 Token/滑块。
     log_with_user(
         'info',
         f"扫码Cookie快速持久化完成: 账号={account_id}, "
@@ -3126,7 +3134,8 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
         'is_new_account': is_new_account,
         'real_cookie_refreshed': False,
         'cookie_field_count': len(cookie_fields),
-        '_manager_operation': manager_operation,
+        '_manager_operation': None,
+        '_previous_cookie': previous_cookie,
     }
 
 
@@ -3156,8 +3165,9 @@ async def _enhance_qr_login_cookies(
     cookies: str,
     current_user: Dict[str, Any],
     manager_operation: Any = None,
+    previous_cookie: str = None,
 ) -> None:
-    """后台补全真实Cookie；失败不回滚已经保存的扫码账号。"""
+    """后台补全真实Cookie；失败时回滚到扫码前的完整 Cookie。"""
     account_id = account_info['account_id']
     user_id = current_user['user_id']
     started_at = time.perf_counter()
@@ -3196,9 +3206,12 @@ async def _enhance_qr_login_cookies(
             if not refreshed_cookies:
                 refresh_success = False
             elif cookie_manager.manager:
-                operation = cookie_manager.manager.update_cookie(
+                # 旧任务已在保存前暂停，这里等完整 Cookie 写入后再启动监听。
+                operation = cookie_manager.manager.ensure_cookie_task(
                     account_id,
                     refreshed_cookies,
+                    user_id=user_id,
+                    restart=False,
                     save_to_db=False,
                 )
                 await _await_cookie_manager_operation(
@@ -3211,6 +3224,35 @@ async def _enhance_qr_login_cookies(
     except Exception as exc:
         refresh_error_type = type(exc).__name__
 
+    if not refresh_success and previous_cookie:
+        # 增强失败时不能把账号留在 9 字段的临时 Cookie 上，否则界面显示
+        # “已保存”但永远无法启动。恢复扫码前的完整 Cookie，等用户重试。
+        try:
+            restored = db_manager.update_cookie_account_info(
+                account_id,
+                cookie_value=previous_cookie,
+                user_id=user_id,
+                allow_create=False,
+                allow_cookie_regression=True,
+            )
+            if cookie_manager.manager and restored:
+                manager_cookies = getattr(cookie_manager.manager, 'cookies', None)
+                if isinstance(manager_cookies, dict):
+                    manager_cookies[account_id] = previous_cookie
+            log_with_user(
+                'warning' if restored else 'error',
+                f"扫码增强失败，{'已回滚旧Cookie' if restored else '回滚旧Cookie失败'}: "
+                f"账号={account_id}",
+                current_user,
+            )
+        except Exception as rollback_exc:
+            log_with_user(
+                'error',
+                f"扫码增强失败后回滚异常: 账号={account_id}, "
+                f"异常类型={type(rollback_exc).__name__}",
+                current_user,
+            )
+
     try:
         latest_cookie_info = db_manager.get_cookie_by_id(account_id)
         profile_cookies = (
@@ -3218,7 +3260,7 @@ async def _enhance_qr_login_cookies(
             if latest_cookie_info
             else cookies
         )
-        if profile_cookies:
+        if refresh_success and profile_cookies:
             profile_result = await _fetch_and_store_account_profile(
                 cookie_id=account_id,
                 cookies_str=profile_cookies,
@@ -3239,7 +3281,7 @@ async def _enhance_qr_login_cookies(
         result['message'] = (
             '账号已保存，Cookie和账号资料补全完成'
             if refresh_success and profile_success
-            else '账号已保存，后台资料仍可在账号管理中手动刷新'
+            else '扫码已确认，但Cookie增强失败，账号暂未启动；请重新扫码'
         )
         result.setdefault('account_info', {})['real_cookie_refreshed'] = refresh_success
         result.setdefault('account_info', {})['profile_refreshed'] = profile_success
