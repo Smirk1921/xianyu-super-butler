@@ -2,9 +2,24 @@
 """人工验证结束后必须恢复监听任务。"""
 
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, Mock, patch
 
 from app import reply_server
+
+
+class RiskEventFreshnessTests(unittest.TestCase):
+    def test_sqlite_utc_event_is_fresh_for_25_minutes(self):
+        now_utc = datetime(2026, 10, 26, 4, 25, 0)
+        self.assertTrue(
+            reply_server.risk_event_is_fresh('2026-10-26 04:00:00', now_utc)
+        )
+
+    def test_sqlite_utc_event_expires_after_one_hour(self):
+        now_utc = datetime(2026, 10, 26, 5, 5, 0)
+        self.assertFalse(
+            reply_server.risk_event_is_fresh('2026-10-26 04:00:00', now_utc)
+        )
 
 
 class ManualCaptchaRestartTests(unittest.IsolatedAsyncioTestCase):

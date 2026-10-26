@@ -11050,6 +11050,20 @@ async def get_fresh_captcha_url(
     )
 
 
+def risk_event_is_fresh(created_at, now_utc=None, window_seconds: int = 3600) -> bool:
+    """判断风控日志是否仍在有效窗口内（SQLite 时间是 UTC）。"""
+    if not created_at:
+        return True
+    try:
+        from datetime import datetime, timezone
+        text = str(created_at).replace('T', ' ').split('.')[0]
+        event_time = datetime.strptime(text, '%Y-%m-%d %H:%M:%S')
+        now_value = now_utc or datetime.now(timezone.utc).replace(tzinfo=None)
+        return (now_value - event_time).total_seconds() <= window_seconds
+    except Exception:
+        return True
+
+
 @app.get('/api/risk-control/status')
 def get_risk_control_status(current_user: Dict[str, Any] = Depends(get_current_user)):
     """查询各账号的风控熔断状态。
@@ -11102,13 +11116,10 @@ def get_risk_control_status(current_user: Dict[str, Any] = Depends(get_current_u
         event_is_fresh = True
         created_at = latest.get('created_at')
         if created_at:
-            try:
-                from datetime import datetime
-                text = str(created_at).replace('T', ' ').split('.')[0]
-                event_time = datetime.strptime(text, '%Y-%m-%d %H:%M:%S')
-                event_is_fresh = (datetime.now() - event_time).total_seconds() <= 3600
-            except Exception:
-                event_is_fresh = True
+            # SQLite CURRENT_TIMESTAMP 存的是 UTC；必须用 UTC 比较，
+            # 否则东八区会把刚发生 25 分钟的滑块事件算成 8 小时前，
+            # 界面直接隐藏人工验证入口。
+            event_is_fresh = risk_event_is_fresh(created_at)
 
         if not event_is_fresh and not state.get('blocked'):
             accounts.append({
