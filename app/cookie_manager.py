@@ -330,25 +330,52 @@ class CookieManager:
         旧实例或新实例仍占着全局浏览器槽位，增强会等满 300 秒并留下残缺
         Cookie，账号就表现为“扫码成功但无法运行”。
         """
-        lock = self._task_locks.setdefault(cookie_id, asyncio.Lock())
-        async with lock:
+        owner_loop = self.loop
+
+        async def _pause_on_owner_loop() -> bool:
+            lock = self._task_locks.setdefault(cookie_id, asyncio.Lock())
+            async with lock:
+                task = self.tasks.pop(cookie_id, None)
+                self.instances.pop(cookie_id, None)
+                if task is None or task.done():
+                    return True
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"【{cookie_id}】暂停监听任务超时（{timeout} 秒），"
+                        "继续扫码流程"
+                    )
+                except Exception as exc:
+                    logger.warning(f"【{cookie_id}】暂停监听任务异常: {exc}")
+                return True
+
+        # 监听任务属于 CookieManager 的事件循环；从 Web 线程直接 cancel()/await
+        # 会抛出 “The future belongs to a different loop than the one specified
+        # as the loop argument”，旧任务根本没停下来，继续占着浏览器槽位。
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is owner_loop:
+            return await _pause_on_owner_loop()
+
+        if not owner_loop.is_running():
             task = self.tasks.pop(cookie_id, None)
             self.instances.pop(cookie_id, None)
-            if task is None or task.done():
-                return True
-            task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"【{cookie_id}】暂停监听任务超时（{timeout} 秒），"
-                    "继续扫码流程"
-                )
-            except Exception as exc:
-                logger.warning(f"【{cookie_id}】暂停监听任务异常: {exc}")
+            if task is not None and not task.done():
+                try:
+                    task.cancel()
+                except Exception as exc:
+                    logger.warning(f"【{cookie_id}】暂停监听任务异常: {exc}")
             return True
+
+        future = asyncio.run_coroutine_threadsafe(_pause_on_owner_loop(), owner_loop)
+        return await asyncio.wrap_future(future)
 
     def ensure_cookie_task(
         self,

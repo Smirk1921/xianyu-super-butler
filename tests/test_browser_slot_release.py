@@ -117,5 +117,100 @@ class QrSessionReleaseTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
 
 
+class SlotCancellationTests(unittest.IsolatedAsyncioTestCase):
+    """取消等待方不能把槽位永久吞掉。
+
+    旧实现用 ``asyncio.to_thread(semaphore.acquire)``，线程不会被取消：
+    外层 ``wait_for`` 超时后线程仍会抢到槽位，而调用方已经离开，槽位再没人
+    归还。之后所有浏览器任务都会等满 300 秒，扫码增强失败后回滚成过期
+    Cookie，账号就表现为“扫码成功但不运行”。
+    """
+
+    def setUp(self):
+        self._saved_semaphore = browser_limit._semaphore
+        self._saved_limit = browser_limit._limit
+        browser_limit._semaphore = None
+        browser_limit._limit = 1
+
+    def tearDown(self):
+        browser_limit._semaphore = self._saved_semaphore
+        browser_limit._limit = self._saved_limit
+
+    async def test_cancelled_waiter_returns_the_slot_it_acquires(self):
+        semaphore = browser_limit._get_semaphore()
+        self.assertTrue(semaphore.acquire(False), "测试前置：应能占到唯一槽位")
+
+        waiter = asyncio.create_task(
+            browser_limit.acquire_slot_async("取消测试", timeout=5)
+        )
+        await asyncio.sleep(0.1)
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+
+        # 把槽位放回：被取消的等待线程仍可能抢到它，但必须立刻归还
+        semaphore.release()
+        await asyncio.sleep(0.5)
+
+        self.assertTrue(
+            semaphore.acquire(False),
+            "被取消的等待方吞掉了槽位，后续浏览器任务会全部排队超时",
+        )
+        semaphore.release()
+
+    async def test_timeout_does_not_consume_the_slot(self):
+        semaphore = browser_limit._get_semaphore()
+        self.assertTrue(semaphore.acquire(False))
+
+        with self.assertRaises(TimeoutError):
+            await browser_limit.acquire_slot_async("超时测试", timeout=0.2)
+
+        semaphore.release()
+        await asyncio.sleep(0.3)
+        self.assertTrue(semaphore.acquire(False), "超时的等待方不应占用槽位")
+        semaphore.release()
+
+
+class PauseAcrossLoopsTests(unittest.IsolatedAsyncioTestCase):
+    """扫码重登时从 Web 事件循环暂停账号任务要真正取消。"""
+
+    async def test_pause_cancels_task_owned_by_another_loop(self):
+        import threading
+
+        from app.cookie_manager import CookieManager
+
+        manager = CookieManager.__new__(CookieManager)
+        manager._task_locks = {}
+        manager.tasks = {}
+        manager.instances = {}
+
+        owner_loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=owner_loop.run_forever, daemon=True)
+        thread.start()
+        manager.loop = owner_loop
+        try:
+            async def _start_task():
+                async def _never():
+                    await asyncio.sleep(3600)
+
+                task = owner_loop.create_task(_never())
+                manager.tasks["acc"] = task
+                manager.instances["acc"] = object()
+                return task
+
+            future = asyncio.run_coroutine_threadsafe(_start_task(), owner_loop)
+            task = await asyncio.wrap_future(future)
+
+            # 调用方在另一个事件循环里（Web 线程），旧实现会抛
+            # “future belongs to a different loop” 并放走旧任务
+            self.assertTrue(await manager.pause_cookie_task("acc", timeout=2))
+            self.assertNotIn("acc", manager.tasks)
+            self.assertNotIn("acc", manager.instances)
+            self.assertTrue(task.done(), "旧监听任务没有被真正取消")
+        finally:
+            owner_loop.call_soon_threadsafe(owner_loop.stop)
+            thread.join(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()

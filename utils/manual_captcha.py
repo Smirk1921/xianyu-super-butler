@@ -184,7 +184,7 @@ async def open_manual_session(
 
         # 人工验证必须与自动滑块共用全局浏览器槽位，否则两套浏览器同时抢 CPU，
         # 拖动时间轴被拉长后真人操作也会被判定为机器。
-        await asyncio.to_thread(browser_limit.acquire_slot, "人工验证码")
+        await browser_limit.acquire_slot_async("人工验证码")
         browser_slot_held = True
 
         # 正式版 Chrome + 持久化 profile 是上游实测结论：Playwright Chromium

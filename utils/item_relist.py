@@ -319,7 +319,7 @@ async def check_seller_session(
     playwright = None
     context = None
     try:
-        await asyncio.to_thread(browser_limit.acquire_slot, "卖家登录态检查")
+        await browser_limit.acquire_slot_async("卖家登录态检查")
         slot_held = True
         profile_dir = await asyncio.to_thread(prepare_profile_dir, cookie_id)
 
@@ -552,7 +552,7 @@ async def relist_item(
     playwright = None
     context = None
     try:
-        await asyncio.to_thread(browser_limit.acquire_slot, "自动重新上架")
+        await browser_limit.acquire_slot_async("自动重新上架")
         slot_held = True
         profile_dir = await asyncio.to_thread(prepare_profile_dir, cookie_id)
 

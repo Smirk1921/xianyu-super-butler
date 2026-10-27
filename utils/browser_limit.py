@@ -123,6 +123,62 @@ class LimitedBrowser:
         return getattr(self._browser, name)
 
 
+def _timeout_error(purpose: str, timeout: float) -> TimeoutError:
+    return TimeoutError(
+        f"{purpose}: 等待浏览器空闲超过 {int(timeout)} 秒。"
+        "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
+    )
+
+
+async def acquire_slot_async(
+    purpose: str = '浏览器任务',
+    timeout: float = _ACQUIRE_TIMEOUT,
+) -> None:
+    """异步取槽位，取消调用方时会把抢到的槽位归还。
+
+    不能用 ``asyncio.to_thread(semaphore.acquire, ...)``：线程不会被取消，
+    外层 ``wait_for`` 超时或任务被 cancel 后，那个线程仍会继续等到槽位，
+    而调用方已经离开，槽位再也无人归还——之后所有浏览器任务（扫码增强、
+    重新上架、Cookie 刷新）都会等满超时。扫码重登时表现为“扫码成功但账号
+    不运行”。
+
+    这里的等待线程把结果投递回事件循环；投递时若等待方已取消，就立刻
+    把槽位还回去，保证槽位不会因为取消而丢失。
+    """
+    semaphore = _get_semaphore()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+
+    def _deliver(acquired: bool) -> None:
+        if future.done():
+            # 等待方已取消或超时，抢到的槽位必须马上归还
+            if acquired:
+                semaphore.release()
+            return
+        future.set_result(acquired)
+
+    def _waiter() -> None:
+        try:
+            acquired = semaphore.acquire(True, timeout)
+        except BaseException:
+            acquired = False
+        try:
+            loop.call_soon_threadsafe(_deliver, acquired)
+        except RuntimeError:
+            # 事件循环已关闭，没人接手这个槽位
+            if acquired:
+                semaphore.release()
+
+    threading.Thread(
+        target=_waiter,
+        name=f'browser-slot-{purpose}',
+        daemon=True,
+    ).start()
+
+    if not await future:
+        raise _timeout_error(purpose, timeout)
+
+
 async def launch_browser(
     playwright: Any,
     launch_options: Optional[Dict[str, Any]] = None,
@@ -134,13 +190,7 @@ async def launch_browser(
     """
     semaphore = _get_semaphore()
 
-    # 在线程里等待，避免占着事件循环不放导致消息收发一起卡住
-    acquired = await asyncio.to_thread(semaphore.acquire, True, _ACQUIRE_TIMEOUT)
-    if not acquired:
-        raise TimeoutError(
-            f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
-            "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
-        )
+    await acquire_slot_async(purpose, _ACQUIRE_TIMEOUT)
 
     try:
         browser = await playwright.chromium.launch(**(launch_options or {}))

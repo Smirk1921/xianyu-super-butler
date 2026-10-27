@@ -692,7 +692,7 @@ class XianyuSearcher:
             # 取一个浏览器槽位，close_browser 时归还。搜索通常由用户手动触发，
             # 但后台的 Cookie 刷新等任务同样在抢 CPU，弱机上并存会互相拖慢。
             if not self._browser_slot_held:
-                await asyncio.to_thread(browser_limit.acquire_slot, "商品搜索")
+                await browser_limit.acquire_slot_async("商品搜索")
                 self._browser_slot_held = True
 
             playwright = await async_playwright().start()
